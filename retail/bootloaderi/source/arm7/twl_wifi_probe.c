@@ -246,6 +246,40 @@ static void logValue(const char* name, u32 val) {
 	dbg_printf("\n");
 }
 
+// Controller registers changed by the probe, in restore order
+static const u16 sdioSavedRegs[] = {
+	SDIO_IRQ32, SDIO_DATA16_CNT, 0x0FC, 0x0FE, SDIO_CARD_OPT, SDIO_PORT_SEL,
+	SDIO_DATA16_BLK_LEN, SDIO_DATA32_BLK_LEN, SDIO_DATA32_BLK_CNT, SDIO_STOP,
+	SDIO_CLK_CNT, SDIO_RESET
+};
+#define SDIO_SAVED_COUNT (sizeof(sdioSavedRegs)/sizeof(sdioSavedRegs[0]))
+
+static void sdioSave(u16* saved, u32* savedIrqMask) {
+	for (u32 i = 0; i < SDIO_SAVED_COUNT; i++) {
+		saved[i] = sdioRead16(sdioSavedRegs[i]);
+	}
+	*savedIrqMask = *(vu32*)(SDIO_BASE + SDIO_IRQ_MASK);
+}
+
+// Puts the chip's SDIO side back to its power-on state, then the controller.
+// Replies aren't checked: the card stops answering once it's reset.
+static void sdioShutdown(const u16* saved, u32 savedIrqMask) {
+	cmd52Write(0, 0x04, 0x00); // Interrupts off
+	cmd52Write(0, 0x02, 0x00); // Function 1 off
+	cmd52Write(0, 0x07, 0x00); // 1-bit bus
+	sdioSetBusWidth(1);
+	cmd52Write(0, 0x06, 0x08); // I/O reset
+	swiDelay(0xF000);
+
+	sdioMask16(SDIO_CLK_CNT, 0x100, 0); // Stop the clock
+	sdioWrite16(SDIO_IRQ_STAT0, 0);
+	sdioWrite16(SDIO_IRQ_STAT1, 0);
+	*(vu32*)(SDIO_BASE + SDIO_IRQ_MASK) = savedIrqMask;
+	for (u32 i = 0; i < SDIO_SAVED_COUNT; i++) {
+		sdioWrite16(sdioSavedRegs[i], saved[i]);
+	}
+}
+
 static int probe(twlWifiProbeResult* result) {
 	sdioControllerInit();
 	sdioSetBusWidth(4);
@@ -346,12 +380,23 @@ int twlWifiProbe(twlWifiProbeResult* result) {
 	REG_GPIO_WIFI &= ~BIT(8); // Select Atheros
 	i2cWriteRegister(0x4A, 0x30, 0x13);
 
+	u16 sdioSaved[SDIO_SAVED_COUNT];
+	u32 sdioSavedIrqMask;
+	sdioSave(sdioSaved, &sdioSavedIrqMask);
+
 	const int ret = probe(result);
+
+	sdioShutdown(sdioSaved, sdioSavedIrqMask);
 
 	i2cWriteRegister(0x4A, 0x30, oldLed);
 	REG_GPIO_WIFI = oldGpioWifi;
 	REG_SCFG_WL = oldScfgWl;
 
+	logValue("Old GPIO_WIFI : ", oldGpioWifi);
+	logValue("Old SCFG_WL : ", oldScfgWl);
+	logValue("Old LED : ", oldLed);
+	logValue("Old SDIO_RESET : ", sdioSaved[SDIO_SAVED_COUNT-1]);
+	logValue("Old SDIO_CLK_CNT : ", sdioSaved[SDIO_SAVED_COUNT-2]);
 	logValue("Result : ", (u32)ret);
 	logValue("SDIO revision : ", result->sdioRevision);
 	logValue("Manufacturer : ", result->manufacturer);
