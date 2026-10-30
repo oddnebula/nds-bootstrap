@@ -3,8 +3,8 @@
  *
  * Brings up the Atheros WiFi chip over the second TMIO SDIO controller and logs
  * what it reports, so DSi-mode WiFi can be checked on real hardware before the
- * game starts. Only CMD52 (single register) accesses are used, and no firmware
- * is touched.
+ * game starts. Only CMD52 (single register) accesses are used. The chip is reset
+ * into its bootloader (BMI) to read its version; no firmware is uploaded.
  *
  * The SDIO controller code and the bring-up sequence are based on DSiWifi:
  *   Copyright (c) 2021 Max Thomas
@@ -63,6 +63,15 @@
 #define AR6002_HOST_INTEREST_ADDRESS	0x00500400
 #define AR601x_HOST_INTEREST_ADDRESS	0x00520000
 #define CHIP_ID_AR6002	0x02000001
+
+// Function 1 registers
+#define F1_MBOX			0x0FF
+#define F1_RX_LOOKAHEAD_VALID	0x405
+#define F1_WINDOW_DATA		0x474
+#define F1_WINDOW_WRITE_ADDR	0x478
+#define F1_WINDOW_READ_ADDR	0x47C
+
+#define BMI_GET_TARGET_ID	0x8
 
 static u32 sdioResp = 0;
 static u16 sdioRca = 0;
@@ -178,8 +187,57 @@ static void write32Msb(u8 func, u32 addr, u32 val) {
 }
 
 static u32 readInternWord(u32 addr) {
-	write32Msb(1, 0x0047C, addr); // WINDOW_READ_ADDR
-	return read32(1, 0x00474); // WINDOW_DATA
+	write32Msb(1, F1_WINDOW_READ_ADDR, addr);
+	return read32(1, F1_WINDOW_DATA);
+}
+
+static void writeInternWord(u32 addr, u32 val) {
+	write32Msb(1, F1_WINDOW_DATA, val);
+	write32Msb(1, F1_WINDOW_WRITE_ADDR, addr);
+}
+
+static void mboxWrite32(u32 val) {
+	for (int i = 0; i < 4; i++) {
+		cmd52Write(1, F1_MBOX, val & 0xFF);
+		val >>= 8;
+	}
+}
+
+static bool mboxRead32(u32* val) {
+	int i;
+	for (i = 0; i < 0x4000 && !sdioError && !(cmd52Read(1, F1_RX_LOOKAHEAD_VALID) & 1); i++);
+	if (i == 0x4000 || sdioError) {
+		return false;
+	}
+
+	*val = 0;
+	for (i = 0; i < 4; i++) {
+		*val |= (u32)cmd52Read(1, F1_MBOX) << (i*8);
+	}
+	return !sdioError;
+}
+
+static bool bmiGetVersion(u32* version) {
+	mboxWrite32(BMI_GET_TARGET_ID);
+	if (!mboxRead32(version)) {
+		return false;
+	}
+	if (*version != 0xFFFFFFFF) {
+		return true;
+	}
+
+	// Extended reply: length, version, then the rest
+	u32 len = 0;
+	if (!mboxRead32(&len) || len < 8 || len > 0x40 || !mboxRead32(version)) {
+		return false;
+	}
+	for (u32 i = 0; i < (len/4)-2; i++) {
+		u32 unused;
+		if (!mboxRead32(&unused)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 static void logValue(const char* name, u32 val) {
@@ -259,6 +317,13 @@ static int probe(twlWifiProbeResult* result) {
 	result->firmwareUploaded = readInternWord(hostInterest + 0x58);
 	if (sdioError) return -8;
 
+	// Reset into the bootloader and ask for its version
+	writeInternWord(0x4000, 0x00000100);
+	swiDelay(0x10000);
+	result->resetCause = readInternWord(0x40C0);
+	if (sdioError) return -9;
+	if (!bmiGetVersion(&result->bmiVersion)) return -10;
+
 	return 0;
 }
 
@@ -269,6 +334,8 @@ int twlWifiProbe(twlWifiProbeResult* result) {
 	result->manufacturer = 0;
 	result->chipId = 0;
 	result->firmwareUploaded = 0;
+	result->resetCause = 0;
+	result->bmiVersion = 0;
 	sdioError = false;
 
 	const u16 oldGpioWifi = REG_GPIO_WIFI;
@@ -290,6 +357,8 @@ int twlWifiProbe(twlWifiProbeResult* result) {
 	logValue("Manufacturer : ", result->manufacturer);
 	logValue("Chip ID : ", result->chipId);
 	logValue("Firmware uploaded : ", result->firmwareUploaded);
+	logValue("Reset cause : ", result->resetCause);
+	logValue("BMI version : ", result->bmiVersion);
 	dbg_printf("\n");
 
 	return ret;

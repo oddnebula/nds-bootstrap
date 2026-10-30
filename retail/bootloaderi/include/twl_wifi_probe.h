@@ -8,6 +8,8 @@ typedef struct {
 	u32 manufacturer;
 	u32 chipId;
 	u32 firmwareUploaded;
+	u32 resetCause;
+	u32 bmiVersion;
 } twlWifiProbeResult;
 
 int twlWifiProbe(twlWifiProbeResult* result);
