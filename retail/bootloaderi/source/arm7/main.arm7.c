@@ -60,6 +60,7 @@
 #include "dmaTwl.h"
 #include "my_fat.h"
 #include "debug_file.h"
+#include "twl_wifi_probe.h"
 #include "nds_header.h"
 #include "module_params.h"
 #include "decompress.h"
@@ -2240,6 +2241,10 @@ int arm7_main(void) {
 			NDSTouchscreenMode();
 			*(vu16*)0x4000500 = 0x807F;
 			if (!dsiModeConfirmed || !ROMsupportsDsiMode(&dsiHeaderTemp.ndshdr)) {
+				if (logging && !i2cBricked) {
+					twlWifiProbeResult wifiProbe;
+					twlWifiProbe(&wifiProbe);	// Log only: check DSi-mode WiFi before leaving it
+				}
 				REG_GPIO_WIFI |= BIT(8);	// Old NDS-Wifi mode
 			}
 		}
