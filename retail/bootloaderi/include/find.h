@@ -146,5 +146,7 @@ u32* findSrlStartOffset7(const tNDSHeader* ndsHeader);
 u32* findSdCardResetOffset(const tNDSHeader* ndsHeader, const module_params_t* moduleParams);
 u32* findSdCardFuncsOffset(const tNDSHeader* ndsHeader);
 u32* findAutoPowerOffOffset(const tNDSHeader* ndsHeader);
+u32* findWmRequestFuncTable(const u32* start, u32 size, u32* count);
+u32* findWmRequestFuncTableOffset(const tNDSHeader* ndsHeader, u32* count);
 
 #endif // FIND_H

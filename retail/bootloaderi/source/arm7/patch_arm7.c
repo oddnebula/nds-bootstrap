@@ -773,6 +773,31 @@ void patchAutoPowerOff(const tNDSHeader* ndsHeader) {
 	dbg_printf("\n\n");
 }
 
+// Log only: locate the WM request table that a WPA implementation would hook
+static void logWmRequestFuncTable(const tNDSHeader* ndsHeader) {
+	if (dsiModeConfirmed) return;
+
+	u32 count = 0;
+	const u32* table = findWmRequestFuncTableOffset(ndsHeader, &count);
+	if (!table) {
+		return;
+	}
+
+	dbg_printf("WM request func table location : ");
+	dbg_hexa((u32)table);
+	dbg_printf("\nWM API count : ");
+	dbg_hexa(count);
+	dbg_printf("\nWMSP_StartConnectEx : ");
+	dbg_hexa(table[0x0C]);
+	dbg_printf("\nWMSP_SetDCFData : ");
+	dbg_hexa(table[0x12]);
+	if (count > 0x27) {
+		dbg_printf("\nWMSP_SetWEPKeyEx : ");
+		dbg_hexa(table[0x27]);
+	}
+	dbg_printf("\n\n");
+}
+
 static void operaRamPatch(void) {
 	// Opera RAM patch (ARM7)
 	*(u32*)0x0238C7BC = 0xC3E0000;
@@ -921,6 +946,8 @@ u32 patchCardNdsArm7(
 	//}
 
 	patchAutoPowerOff(ndsHeader);
+
+	logWmRequestFuncTable(ndsHeader);
 
 	dbg_printf("ERR_NONE\n\n");
 	return ERR_NONE;
