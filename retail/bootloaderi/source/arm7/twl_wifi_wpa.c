@@ -136,6 +136,62 @@ void wpaHmacSha1(u8* out, const u8* key, u32 keyLen, const u8* data, u32 dataLen
 	sha1Final(&ctx, out);
 }
 
+// One PBKDF2 round: HMAC of the previous digest, with the key already absorbed
+static void hmacContinue(u8* digest, const sha1Ctx* inner, const sha1Ctx* outer, const u8* data, u32 dataLen) {
+	sha1Ctx ctx = *inner;
+	sha1Update(&ctx, data, dataLen);
+	sha1Final(&ctx, digest);
+
+	ctx = *outer;
+	sha1Update(&ctx, digest, WPA_SHA1_LEN);
+	sha1Final(&ctx, digest);
+}
+
+void wpaPassphraseToPmk(u8* pmk, const u8* pass, u32 passLen, const u8* ssid, u32 ssidLen) {
+	sha1Ctx inner, outer;
+	u8 pad[SHA1_BLOCK];
+	u8 salt[32 + 4];
+	u8 digest[WPA_SHA1_LEN];
+	u8 block[WPA_SHA1_LEN];
+
+	for (u32 i = 0; i < SHA1_BLOCK; i++) {
+		pad[i] = (i < passLen ? pass[i] : 0) ^ 0x36;
+	}
+	sha1Init(&inner);
+	sha1Update(&inner, pad, SHA1_BLOCK);
+	for (u32 i = 0; i < SHA1_BLOCK; i++) {
+		pad[i] ^= 0x36 ^ 0x5C;
+	}
+	sha1Init(&outer);
+	sha1Update(&outer, pad, SHA1_BLOCK);
+
+	for (u32 i = 0; i < ssidLen; i++) {
+		salt[i] = ssid[i];
+	}
+
+	for (u32 blockIndex = 1, done = 0; done < 32; blockIndex++, done += WPA_SHA1_LEN) {
+		salt[ssidLen+0] = 0;
+		salt[ssidLen+1] = 0;
+		salt[ssidLen+2] = 0;
+		salt[ssidLen+3] = blockIndex;
+
+		hmacContinue(digest, &inner, &outer, salt, ssidLen + 4);
+		for (u32 i = 0; i < WPA_SHA1_LEN; i++) {
+			block[i] = digest[i];
+		}
+		for (u32 round = 1; round < 4096; round++) {
+			hmacContinue(digest, &inner, &outer, digest, WPA_SHA1_LEN);
+			for (u32 i = 0; i < WPA_SHA1_LEN; i++) {
+				block[i] ^= digest[i];
+			}
+		}
+
+		for (u32 i = 0; i < WPA_SHA1_LEN && done + i < 32; i++) {
+			pmk[done+i] = block[i];
+		}
+	}
+}
+
 void wpaPrf(u8* out, u32 outLen, const u8* key, u32 keyLen, u8* data, u32 dataLen) {
 	u8 temp[WPA_SHA1_LEN];
 	u8* counter = data + dataLen - 1;

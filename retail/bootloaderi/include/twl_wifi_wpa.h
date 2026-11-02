@@ -16,6 +16,9 @@ typedef uint32_t u32;
 
 void wpaHmacSha1(u8* out, const u8* key, u32 keyLen, const u8* data, u32 dataLen);
 
+// PBKDF2 with 4096 rounds. This takes a few seconds on the ARM7.
+void wpaPassphraseToPmk(u8* pmk, const u8* pass, u32 passLen, const u8* ssid, u32 ssidLen);
+
 // IEEE 802.11i PRF. Data is label, a zero byte, input, and a final counter byte.
 void wpaPrf(u8* out, u32 outLen, const u8* key, u32 keyLen, u8* data, u32 dataLen);
 

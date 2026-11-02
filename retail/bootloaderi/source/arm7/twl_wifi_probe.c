@@ -416,19 +416,22 @@ static u8 selfMac[6];
 #define WIFI_CFG_SSID_LEN	0xE8
 #define WIFI_CFG_SLOT		0xEF
 #define WIFI_CFG_PMK		0x100
+#define WIFI_CFG_PASS		0x120
+#define WIFI_CFG_PASS_LEN	0x40
 #define WIFI_CFG_WPA_TYPE	0x181
 
 typedef struct {
 	u8 ssid[32];
 	u8 ssidLen;
 	u8 pmk[32];
+	u8 cfgIndex;
 } savedNetwork;
 
 static savedNetwork savedNetworks[3];
 static u32 savedCount = 0;
 
 // The saved network the scan found
-static const savedNetwork* targetNetwork = NULL;
+static savedNetwork* targetNetwork = NULL;
 static u8 targetBssid[6];
 static u16 targetMhz = 0;
 static u8 targetSnr = 0;
@@ -721,6 +724,7 @@ static void readSavedNetworks(void) {
 
 		readFirmware(base + WIFI_CFG_SSID, net->ssid, net->ssidLen);
 		readFirmware(base + WIFI_CFG_PMK, net->pmk, sizeof(net->pmk));
+		net->cfgIndex = i;
 		logText("Saved network : ", net->ssid, net->ssidLen);
 		logValue(" Slot : ", i + 4);
 		logValue(" WPA mode : ", wpaMode);
@@ -774,7 +778,7 @@ static void handleBss(void) {
 	}
 
 	for (u32 i = 0; i < savedCount; i++) {
-		const savedNetwork* net = &savedNetworks[i];
+		savedNetwork* net = &savedNetworks[i];
 		if (ssidLen != net->ssidLen || !sameBytes(htcBuf + ssid, net->ssid, ssidLen)) {
 			continue;
 		}
@@ -1167,8 +1171,43 @@ static int wmiScan(void) {
 	return finished ? 0 : -56;
 }
 
+// Checks the saved key against the saved password, and prefers the password. Only
+// logs whether things are present and whether they match, never the values.
+static void checkSavedKey(void) {
+	u8 pass[WIFI_CFG_PASS_LEN];
+	u8 derived[sizeof(targetNetwork->pmk)];
+
+	readFirmware(WIFI_CFG_ADDR + targetNetwork->cfgIndex*WIFI_CFG_SIZE + WIFI_CFG_PASS, pass, sizeof(pass));
+	u32 passLen = 0;
+	while (passLen < sizeof(pass) && pass[passLen] != 0) {
+		passLen++;
+	}
+
+	bool keySet = false;
+	for (u32 i = 0; i < sizeof(targetNetwork->pmk); i++) {
+		keySet |= (targetNetwork->pmk[i] != 0);
+	}
+	logValue("Saved key present : ", keySet);
+
+	const bool passUsable = (passLen >= 8 && passLen <= 63);
+	logValue("Saved password usable : ", passUsable);
+	if (passUsable) {
+		wpaPassphraseToPmk(derived, pass, passLen, targetNetwork->ssid, targetNetwork->ssidLen);
+		const bool match = sameBytes(derived, targetNetwork->pmk, sizeof(derived));
+		logValue("Saved key matches password : ", match);
+		if (!match) {
+			copyBytes(targetNetwork->pmk, derived, sizeof(derived));
+		}
+	}
+
+	clearBytes(pass, sizeof(pass));
+	clearBytes(derived, sizeof(derived));
+}
+
 // Stops scanning and asks the firmware to join the network, as Calico does
 static int wmiConnect(void) {
+	checkSavedKey();
+
 	if (!wmiBegin() || !wmiSend(WMI_CMD_SET_BSS_FILTER, 8)) return -62;
 	if (!wmiBegin() || !wmiSend(WMI_CMD_SET_PROBED_SSID, 35)) return -63;
 
