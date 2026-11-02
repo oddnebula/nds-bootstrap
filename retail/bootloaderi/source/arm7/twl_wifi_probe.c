@@ -17,12 +17,15 @@
  * identify the chip are kept.
  */
 
+#include <stddef.h> // NULL
 #include <nds/ndstypes.h>
 #include <nds/system.h>
 #include <nds/bios.h>
 #include <nds/arm7/i2c.h>
+#include <nds/arm7/serial.h>
 #include "debug_file.h"
 #include "twl_wifi_probe.h"
+#include "twl_wifi_wpa.h"
 
 #define REG_GPIO_WIFI	*(vu16*)0x4004C04
 #define REG_SCFG_WL	*(vu16*)0x4004020
@@ -618,6 +621,7 @@ void twlWifiEarlyCheck(void) {
 // and a pad byte. Packets are rounded up to the mailbox block size.
 #define HTC_BLOCK		128
 #define HTC_HDR			6
+#define HTC_MAX_PACKET		2048
 #define HTC_MSG_READY		1
 #define HTC_MSG_CONNECT		2
 #define HTC_MSG_CONNECT_REPLY	3
@@ -626,47 +630,256 @@ void twlWifiEarlyCheck(void) {
 #define HTC_SRV_WMI_DATA_BE	0x0101
 #define HTC_SRV_WMI_DATA_VO	0x0104
 #define HTC_FLAGS_WMI_DATA	5 // Reduce credit dribble, threshold 0.5
-#define WMI_EVENT_READY		0x1001
-#define WMI_PROTOCOL_VERSION	2
+#define HTC_FLAG_NEED_CREDIT_UPDATE 1
+#define HTC_FLAG_RECV_TRAILER	2
+#define HTC_RECORD_CREDIT	1
 
-#define WMI_CMD_GET_CHANNEL_LIST 0x000E
-#define WMI_CMD_ERROR_REPORT	0x0022
-#define WMI_CMD_SET_HB_TIMEOUT	0x0047
+#define WMI_CMD_CONNECT		0x0001
+#define WMI_CMD_DISCONNECT	0x0003
+#define WMI_CMD_SYNCHRONIZE	0x0004
+#define WMI_CMD_CREATE_PSTREAM	0x0005
 #define WMI_CMD_START_SCAN	0x0007
 #define WMI_CMD_SET_SCAN_PARAMS	0x0008
 #define WMI_CMD_SET_BSS_FILTER	0x0009
 #define WMI_CMD_SET_PROBED_SSID	0x000A
+#define WMI_CMD_SET_DISC_TIMEOUT 0x000D
+#define WMI_CMD_GET_CHANNEL_LIST 0x000E
 #define WMI_CMD_SET_CHANNEL_PARAMS 0x0011
+#define WMI_CMD_SET_POWER_MODE	0x0012
+#define WMI_CMD_ADD_CIPHER_KEY	0x0016
+#define WMI_CMD_ERROR_REPORT	0x0022
+#define WMI_CMD_SET_KEEP_ALIVE	0x003D
+#define WMI_CMD_SET_WSC_STATUS	0x0041
+#define WMI_CMD_SET_HB_TIMEOUT	0x0047
+#define WMI_CMD_SET_FRAME_RATE	0x0048
+#define WMI_CMD_SET_BIT_RATE	0xF000
+#define WMI_EVENT_CHANNEL_LIST	0x000E
+#define WMI_EVENT_READY		0x1001
+#define WMI_EVENT_CONNECTED	0x1002
+#define WMI_EVENT_DISCONNECTED	0x1003
 #define WMI_EVENT_BSS_INFO	0x1004
+#define WMI_EVENT_REG_DOMAIN	0x1006
 #define WMI_EVENT_SCAN_COMPLETE	0x100A
+#define WMI_EVENT_EXTENSION	0x1010
+#define WMI_PROTOCOL_VERSION	2
 #define WMI_PHY_11G		2
+#define WMI_BSS_FILTER_NONE	0
 #define WMI_BSS_FILTER_ALL	1
 #define WMI_SCAN_CONNECT	BIT(0)
-#define HTC_FLAG_NEED_CREDIT_UPDATE 1
+#define WMI_SCAN_ACTIVE		BIT(2)
+#define WMI_SCAN_ROAM		BIT(3)
+#define WMI_POWER_MAX_PERFORMANCE 2
+#define WMI_CIPHER_TKIP		3
+#define WMI_CIPHER_AES		4
+#define WMI_AUTH_WPA2_PSK	5
+#define WMI_KEY_USAGE_GROUP	1
+#define WMI_KEY_OP_INIT_TSC_RSC	3
 
 #define CMD53_MAX_LEN		256
+#define WMI_BODY		(HTC_HDR + 2)
 
-static u32 htcWords[1600/sizeof(u32)];
+// The last received message
+static u32 htcWords[HTC_MAX_PACKET/sizeof(u32)];
 #define htcBuf ((u8*)htcWords)
+
+// The message being built. Separate, since waiting for a credit receives messages
+static u32 txWords[CMD53_MAX_LEN/sizeof(u32)];
+#define txBuf ((u8*)txWords)
+
+static u32 htcPayloadLen = 0; // Without the trailer
+static u32 htcCredits = 0;
+static u8 wmiEndpoint = 0;
+static u8 wmiDataEndpoint = 0;
+static u32 hostInterestAddr = 0;
+static u8 selfMac[6];
+
+// The saved connections, slots 4 to 6 in the system settings
+#define WIFI_CFG_ADDR		0x1F400
+#define WIFI_CFG_SIZE		0x200
+#define WIFI_CFG_SSID		0x40
+#define WIFI_CFG_WPA_MODE	0xE7
+#define WIFI_CFG_SSID_LEN	0xE8
+#define WIFI_CFG_SLOT		0xEF
+#define WIFI_CFG_PMK		0x100
+#define WIFI_CFG_WPA_TYPE	0x181
+
+typedef struct {
+	u8 ssid[32];
+	u8 ssidLen;
+	u8 pmk[32];
+} savedNetwork;
+
+static savedNetwork savedNetworks[3];
+static u32 savedCount = 0;
+
+// The saved network the scan found
+static const savedNetwork* targetNetwork = NULL;
+static u8 targetBssid[6];
+static u16 targetMhz = 0;
+static u8 targetSnr = 0;
+static u8 targetGroupCipher = 0;
+
+static bool scanDone = false;
+static u32 scanResults = 0;
+static u16 channels[14];
+static u32 channelCount = 0;
+static bool channelsReady = false;
+
+static bool wifiAssociated = false;
+static bool wifiDisconnected = false;
+static u32 dataFrames = 0;
+
+// WPA2 handshake state
+#define EAPOL_ETHERTYPE		0x888E
+#define EAPOL_HDR		4
+#define EAPOL_KEY_HDR		95
+#define EAPOL_KEY_INFO		1
+#define EAPOL_KEY_REPLAY	5
+#define EAPOL_KEY_NONCE		13
+#define EAPOL_KEY_RSC		61
+#define EAPOL_KEY_MIC		77
+#define EAPOL_KEY_DATA_LEN	93
+#define EAPOL_INFO_VERSION	0x0007
+#define EAPOL_INFO_PAIRWISE	0x0008
+#define EAPOL_INFO_INDEX	0x0030
+#define EAPOL_INFO_ACK		0x0080
+#define EAPOL_INFO_MIC		0x0100
+#define EAPOL_INFO_SECURE	0x0200
+#define EAPOL_INFO_ERROR	0x0400
+#define EAPOL_INFO_REQUEST	0x0800
+#define EAPOL_INFO_ENCRYPTED	0x1000
+#define EAPOL_MIC_LEN		16
+#define EAPOL_NONCE_LEN		32
+#define EAPOL_REPLAY_LEN	8
+#define WPA_KCK_LEN		16
+#define WPA_KEK_OFFSET		16
+#define WPA_TK_OFFSET		32
+#define WPA_TK_LEN		16
+#define WPA_PTK_LEN		48
+
+static u8 apMac[6];
+static u8 assocIe[64];
+static u32 assocIeLen = 0;
+static u8 eapolVersion = 0;
+static u8 eapolReplay[EAPOL_REPLAY_LEN];
+static bool eapolReplaySet = false;
+static u8 anonce[EAPOL_NONCE_LEN];
+static u8 ptk[WPA_PTK_LEN];
+static bool ptkReady = false;
+static u8 gtk[32];
+static u32 gtkLen = 0;
+static u32 gtkIndex = 0;
+static u8 groupRsc[8];
+static u8 keyData[256];
+static bool wpaBusy = false;
+static bool wpaComplete = false;
 
 static inline u16 htcGet16(u32 offset) {
 	return htcBuf[offset] | (htcBuf[offset+1] << 8);
 }
 
-static inline void htcPut16(u32 offset, u16 val) {
-	htcBuf[offset] = val & 0xFF;
-	htcBuf[offset+1] = val >> 8;
+static inline u16 htcGetBe16(u32 offset) {
+	return (htcBuf[offset] << 8) | htcBuf[offset+1];
 }
 
-static void htcClear(void) {
-	for (u32 i = 0; i < sizeof(htcWords)/sizeof(u32); i++) {
-		htcWords[i] = 0;
+static inline void txPut16(u32 offset, u16 val) {
+	txBuf[offset] = val & 0xFF;
+	txBuf[offset+1] = val >> 8;
+}
+
+static inline void txPutBe16(u32 offset, u16 val) {
+	txBuf[offset] = val >> 8;
+	txBuf[offset+1] = val & 0xFF;
+}
+
+static inline void txPut32(u32 offset, u32 val) {
+	txPut16(offset, val & 0xFFFF);
+	txPut16(offset+2, val >> 16);
+}
+
+static void txCopy(u32 offset, const u8* data, u32 len) {
+	for (u32 i = 0; i < len; i++) {
+		txBuf[offset+i] = data[i];
 	}
 }
 
+static void txClear(void) {
+	for (u32 i = 0; i < sizeof(txWords)/sizeof(u32); i++) {
+		txWords[i] = 0;
+	}
+}
+
+static bool bytesLess(const u8* a, const u8* b, u32 len) {
+	for (u32 i = 0; i < len; i++) {
+		if (a[i] != b[i]) {
+			return a[i] < b[i];
+		}
+	}
+	return false;
+}
+
+static void clearBytes(u8* data, u32 len) {
+	while (len--) {
+		*data++ = 0;
+	}
+}
+
+static void copyBytes(u8* dst, const u8* src, u32 len) {
+	while (len--) {
+		*dst++ = *src++;
+	}
+}
+
+static bool sameBytes(const u8* a, const u8* b, u32 len) {
+	while (len--) {
+		if (*a++ != *b++) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void logText(const char* name, const u8* text, u32 len) {
+	char line[33];
+	for (u32 i = 0; i < len; i++) {
+		line[i] = (text[i] >= 0x20 && text[i] < 0x7F) ? text[i] : '?';
+	}
+	line[len] = 0;
+	dbg_printf(name);
+	dbg_printf(line);
+	dbg_printf("\n");
+}
+
 static bool htcSend(u32 payloadLen) {
-	htcPut16(2, payloadLen);
-	return cmd53(true, 0x1000 - HTC_BLOCK, htcWords, HTC_BLOCK);
+	txPut16(2, payloadLen);
+	const u32 len = (HTC_HDR + payloadLen + HTC_BLOCK - 1) & ~(HTC_BLOCK - 1);
+	return cmd53(true, 0x1000 - len, txWords, len);
+}
+
+// Takes the payload length and any credits out of a received message
+static void htcProcessTrailer(void) {
+	htcPayloadLen = htcGet16(2);
+	if (!(htcBuf[1] & HTC_FLAG_RECV_TRAILER) || htcBuf[4] > htcPayloadLen) {
+		return;
+	}
+
+	htcPayloadLen -= htcBuf[4];
+	u32 pos = HTC_HDR + htcPayloadLen;
+	const u32 end = pos + htcBuf[4];
+	while (pos + 2 <= end) {
+		const u8 id = htcBuf[pos];
+		const u8 len = htcBuf[pos+1];
+		pos += 2;
+		if (pos + len > end) {
+			break;
+		}
+		if (id == HTC_RECORD_CREDIT) {
+			for (u32 i = 1; i < len; i += 2) {
+				htcCredits += htcBuf[pos+i];
+			}
+		}
+		pos += len;
+	}
 }
 
 static bool htcRecv(void) {
@@ -688,6 +901,7 @@ static bool htcRecv(void) {
 	const u32 lookahead = regs[2];
 	const u32 len = (HTC_HDR + (lookahead >> 16) + HTC_BLOCK - 1) & ~(HTC_BLOCK - 1);
 	if (len > sizeof(htcWords)) {
+		logValue("Message too long : ", lookahead);
 		return false;
 	}
 	for (u32 done = 0; done < len; done += CMD53_MAX_LEN) {
@@ -701,15 +915,17 @@ static bool htcRecv(void) {
 		logValue("Frame start : ", htcWords[0]);
 		return false;
 	}
+
+	htcProcessTrailer();
 	return true;
 }
 
 // Returns the endpoint, or 0 on failure
 static u8 htcConnect(u16 service, u16 flags) {
-	htcClear();
-	htcPut16(HTC_HDR, HTC_MSG_CONNECT);
-	htcPut16(HTC_HDR+2, service);
-	htcPut16(HTC_HDR+4, flags);
+	txClear();
+	txPut16(HTC_HDR, HTC_MSG_CONNECT);
+	txPut16(HTC_HDR+2, service);
+	txPut16(HTC_HDR+4, flags);
 	if (!htcSend(HTC_HDR + 8) || !htcRecv()) {
 		return 0;
 	}
@@ -722,38 +938,99 @@ static u8 htcConnect(u16 service, u16 flags) {
 	return endpoint;
 }
 
-static u8 wmiEndpoint = 0;
-static u32 hostInterestAddr = 0;
-static u32 creditMessages = 0;
+static bool wmiPump(void);
+
+// Waits for a send credit, then starts a new message
+static bool wmiBegin(void) {
+	int silent = 0;
+	for (int i = 0; htcCredits == 0; i++) {
+		if (i > 500 || silent > 8) {
+			logValue("Out of credits : ", i);
+			return false;
+		}
+		if (wmiPump()) {
+			silent = 0;
+		} else if (sdioError) {
+			return false;
+		} else {
+			silent++;
+		}
+	}
+	txClear();
+	return true;
+}
 
 static bool wmiSend(u16 id, u32 bodyLen) {
-	htcBuf[0] = wmiEndpoint;
-	htcBuf[1] = HTC_FLAG_NEED_CREDIT_UPDATE;
-	htcPut16(HTC_HDR, id);
+	txBuf[0] = wmiEndpoint;
+	txBuf[1] = HTC_FLAG_NEED_CREDIT_UPDATE;
+	txPut16(HTC_HDR, id);
+	htcCredits--;
 	return htcSend(2 + bodyLen);
 }
 
-#define WMI_BODY (HTC_HDR + 2)
-
-static inline void htcPut32(u32 offset, u32 val) {
-	htcPut16(offset, val & 0xFFFF);
-	htcPut16(offset+2, val >> 16);
+static bool wmiCmd(u16 id) {
+	return wmiBegin() && wmiSend(id, 0);
 }
 
-// Logs one scan result: BSS header, then a beacon body with its information
-// elements after the timestamp, interval and capability fields
-static void logBss(u32 payloadLen) {
+static bool wmiCmd8(u16 id, u8 val) {
+	if (!wmiBegin()) {
+		return false;
+	}
+	txBuf[WMI_BODY] = val;
+	return wmiSend(id, 1);
+}
+
+static bool wmiCmd32(u16 id, u32 val) {
+	if (!wmiBegin()) {
+		return false;
+	}
+	txPut32(WMI_BODY, val);
+	return wmiSend(id, sizeof(u32));
+}
+
+static void readSavedNetworks(void) {
+	savedCount = 0;
+	for (u32 i = 0; i < 3; i++) {
+		const u32 base = WIFI_CFG_ADDR + i*WIFI_CFG_SIZE;
+		savedNetwork* net = &savedNetworks[savedCount];
+		u8 wpaMode = 0xFF;
+		u8 wpaType = 0;
+		u8 slot = 0;
+		readFirmware(base + WIFI_CFG_WPA_MODE, &wpaMode, 1);
+		readFirmware(base + WIFI_CFG_WPA_TYPE, &wpaType, 1);
+		readFirmware(base + WIFI_CFG_SLOT, &slot, 1);
+		readFirmware(base + WIFI_CFG_SSID_LEN, &net->ssidLen, 1);
+		if (net->ssidLen == 0 || net->ssidLen > 32 || wpaMode == 0xFF || slot == 0) {
+			continue;
+		}
+
+		readFirmware(base + WIFI_CFG_SSID, net->ssid, net->ssidLen);
+		readFirmware(base + WIFI_CFG_PMK, net->pmk, sizeof(net->pmk));
+		logText("Saved network : ", net->ssid, net->ssidLen);
+		logValue(" Slot : ", i + 4);
+		logValue(" WPA mode : ", wpaMode);
+		logValue(" WPA type : ", wpaType);
+		savedCount++;
+	}
+	logValue("Saved networks : ", savedCount);
+}
+
+// Scan result: BSS header, then a beacon body with its information elements after
+// the timestamp, interval and capability fields. Only saved networks are kept.
+static void handleBss(void) {
 	const u32 hdr = WMI_BODY;
-	const u32 end = HTC_HDR + payloadLen;
+	const u32 end = HTC_HDR + htcPayloadLen;
 	const u32 body = hdr + 16;
-	if (end > sizeof(htcWords) || body + 12 > end) {
+	scanResults++;
+	if (body + 12 > end) {
 		return;
 	}
 
-	char ssid[33];
+	u32 ssid = 0;
 	u32 ssidLen = 0;
-	bool rsn = false;
-	bool wpa = false;
+	bool ccmp = false;
+	bool psk = false;
+	u8 groupCipher = 0;
 	for (u32 ie = body + 12; ie + 2 <= end; ie += 2 + htcBuf[ie+1]) {
 		const u8 id = htcBuf[ie];
 		const u8 len = htcBuf[ie+1];
@@ -761,57 +1038,544 @@ static void logBss(u32 payloadLen) {
 			break;
 		}
 		if (id == 0 && len <= 32) {
-			for (u32 i = 0; i < len; i++) {
-				const u8 c = htcBuf[ie+2+i];
-				ssid[i] = (c >= 0x20 && c < 0x7F) ? c : '?';
-			}
+			ssid = ie + 2;
 			ssidLen = len;
-		} else if (id == 48) {
-			rsn = true;
-		} else if (id == 221 && len >= 4 && htcBuf[ie+2] == 0x00 && htcBuf[ie+3] == 0x50
-		        && htcBuf[ie+4] == 0xF2 && htcBuf[ie+5] == 0x01) {
-			wpa = true;
+		} else if (id == 48 && len >= 8) {
+			// RSN: version, group suite, pairwise suites, key management suites
+			groupCipher = htcBuf[ie+2+5];
+			const u32 pairwiseCount = htcGet16(ie+2+6);
+			u32 pos = ie + 2 + 8;
+			for (u32 i = 0; i < pairwiseCount && pos + 4 <= ie + 2 + len; i++, pos += 4) {
+				ccmp |= (htcBuf[pos+3] == 4);
+			}
+			if (pos + 2 <= ie + 2 + len) {
+				const u32 akmCount = htcGet16(pos);
+				pos += 2;
+				for (u32 i = 0; i < akmCount && pos + 4 <= ie + 2 + len; i++, pos += 4) {
+					psk |= (htcBuf[pos+3] == 2);
+				}
+			}
 		}
 	}
-	ssid[ssidLen] = 0;
 
-	dbg_printf("BSS : ");
-	dbg_printf(ssid);
-	dbg_printf("\n");
-	logValue(" MHz : ", htcGet16(hdr));
-	logValue(" SNR : ", htcBuf[hdr+3]);
-	const bool privacy = htcBuf[body+10] & BIT(4);
-	dbg_printf(rsn ? " Security : WPA2\n" : wpa ? " Security : WPA\n" : privacy ? " Security : WEP\n" : " Security : Open\n");
+	for (u32 i = 0; i < savedCount; i++) {
+		const savedNetwork* net = &savedNetworks[i];
+		if (ssidLen != net->ssidLen || !sameBytes(htcBuf + ssid, net->ssid, ssidLen)) {
+			continue;
+		}
+
+		const u8 snr = htcBuf[hdr+3];
+		logText("Found saved network : ", net->ssid, net->ssidLen);
+		logValue(" MHz : ", htcGet16(hdr));
+		logValue(" SNR : ", snr);
+		logValue(" CCMP and PSK : ", ccmp && psk);
+		if (ccmp && psk && (targetNetwork == NULL || snr > targetSnr)) {
+			targetNetwork = net;
+			targetSnr = snr;
+			targetMhz = htcGet16(hdr);
+			targetGroupCipher = groupCipher;
+			copyBytes(targetBssid, htcBuf + hdr + 6, sizeof(targetBssid));
+		}
+	}
 }
 
-static bool wmiSendParam32(u16 id, u32 val) {
-	htcClear();
-	htcPut32(WMI_BODY, val);
-	return wmiSend(id, sizeof(u32));
+static void handleChannelList(void) {
+	channelCount = 0;
+	for (u32 i = 0; i < htcBuf[WMI_BODY+1] && channelCount < 14; i++) {
+		const u16 mhz = htcGet16(WMI_BODY + 2 + i*2);
+		if (mhz < 3000) {
+			channels[channelCount++] = mhz;
+		}
+	}
+	channelsReady = true;
 }
 
-// Waits for an event, logging anything else from the firmware
-static bool wmiWaitEvent(u16 event) {
-	for (int silent = 0; silent < 8;) {
-		if (!htcRecv()) {
-			if (sdioError) return false;
+// The firmware's association request holds the RSN element the handshake repeats
+static void handleConnected(void) {
+	const u32 beaconLen = htcBuf[WMI_BODY+16];
+	const u32 requestLen = htcBuf[WMI_BODY+17];
+	const u32 requestPos = WMI_BODY + 19 + beaconLen;
+	const u32 end = requestPos + requestLen;
+
+	assocIeLen = 0;
+	for (u32 ie = requestPos + 4; requestLen >= 4 && ie + 2 <= end; ie += 2 + htcBuf[ie+1]) {
+		const u32 len = 2 + htcBuf[ie+1];
+		if (ie + len > end) {
+			break;
+		}
+		if (htcBuf[ie] == 48 && len <= sizeof(assocIe)) {
+			copyBytes(assocIe, htcBuf + ie, len);
+			assocIeLen = len;
+			break;
+		}
+	}
+
+	logValue("Associated, MHz : ", htcGet16(WMI_BODY));
+	logValue("RSN element length : ", assocIeLen);
+	wifiAssociated = true;
+}
+
+static bool wpaSendKey(u16 rxInfo, const u8* nonce, const u8* data, u32 dataLen) {
+	const u32 mac = HTC_HDR + 2;
+	const u32 llc = mac + 14;
+	const u32 eapol = llc + 8;
+	const u32 key = eapol + EAPOL_HDR;
+	const u32 bodyLen = EAPOL_KEY_HDR + dataLen;
+
+	if (key + bodyLen > sizeof(txWords) || !wmiBegin()) {
+		return false;
+	}
+
+	txCopy(mac, apMac, sizeof(apMac));
+	txCopy(mac + 6, selfMac, sizeof(selfMac));
+	txPutBe16(mac + 12, 8 + EAPOL_HDR + bodyLen);
+
+	const u8 snap[8] = {0xAA, 0xAA, 0x03, 0, 0, 0, EAPOL_ETHERTYPE >> 8, EAPOL_ETHERTYPE & 0xFF};
+	txCopy(llc, snap, sizeof(snap));
+
+	txBuf[eapol] = eapolVersion;
+	txBuf[eapol+1] = 3; // EAPOL-Key
+	txPutBe16(eapol + 2, bodyLen);
+
+	txBuf[key] = 2; // RSN
+	txPutBe16(key + EAPOL_KEY_INFO, (rxInfo & EAPOL_INFO_VERSION) | EAPOL_INFO_MIC | (rxInfo &
+		(EAPOL_INFO_PAIRWISE | EAPOL_INFO_INDEX | EAPOL_INFO_SECURE | EAPOL_INFO_ERROR | EAPOL_INFO_REQUEST)));
+	txCopy(key + EAPOL_KEY_REPLAY, eapolReplay, sizeof(eapolReplay));
+	if (nonce) {
+		txCopy(key + EAPOL_KEY_NONCE, nonce, EAPOL_NONCE_LEN);
+	}
+	txPutBe16(key + EAPOL_KEY_DATA_LEN, dataLen);
+	if (data) {
+		txCopy(key + EAPOL_KEY_HDR, data, dataLen);
+	}
+
+	u8 digest[WPA_SHA1_LEN];
+	wpaHmacSha1(digest, ptk, WPA_KCK_LEN, txBuf + eapol, EAPOL_HDR + bodyLen);
+	txCopy(key + EAPOL_KEY_MIC, digest, EAPOL_MIC_LEN);
+
+	txBuf[0] = wmiDataEndpoint;
+	txBuf[1] = HTC_FLAG_NEED_CREDIT_UPDATE;
+	htcCredits--;
+	return htcSend(2 + 14 + 8 + EAPOL_HDR + bodyLen);
+}
+
+// Message 1 of 4: the router's nonce gives us everything to derive the keys
+static void wpaHandleMessage1(u32 key, u16 info) {
+	if (targetNetwork == NULL || assocIeLen == 0) {
+		logValue("Handshake not ready : ", assocIeLen);
+		return;
+	}
+
+	copyBytes(anonce, htcBuf + key + EAPOL_KEY_NONCE, sizeof(anonce));
+
+	// Our nonce: the saved key, the router's nonce and what timing we have
+	u8 snonce[EAPOL_NONCE_LEN];
+	u8 seed[13 + sizeof(selfMac) + sizeof(anonce) + 4 + 1];
+	clearBytes(seed, sizeof(seed));
+	copyBytes(seed, (const u8*)"Init Counter", 12);
+	copyBytes(seed + 13, selfMac, sizeof(selfMac));
+	copyBytes(seed + 19, anonce, sizeof(anonce));
+	seed[51] = REG_VCOUNT & 0xFF;
+	seed[52] = dataFrames & 0xFF;
+	seed[53] = htcCredits & 0xFF;
+	wpaPrf(snonce, sizeof(snonce), targetNetwork->pmk, sizeof(targetNetwork->pmk), seed, sizeof(seed));
+
+	// Pairwise key expansion: both MACs and both nonces, each pair lowest first
+	u8 pad[23 + 12 + 2*EAPOL_NONCE_LEN + 1];
+	clearBytes(pad, sizeof(pad));
+	copyBytes(pad, (const u8*)"Pairwise key expansion", 22);
+
+	const bool selfFirst = bytesLess(selfMac, apMac, sizeof(selfMac));
+	copyBytes(pad + 23, selfFirst ? selfMac : apMac, 6);
+	copyBytes(pad + 29, selfFirst ? apMac : selfMac, 6);
+
+	const bool snonceFirst = bytesLess(snonce, anonce, sizeof(anonce));
+	copyBytes(pad + 35, snonceFirst ? snonce : anonce, EAPOL_NONCE_LEN);
+	copyBytes(pad + 67, snonceFirst ? anonce : snonce, EAPOL_NONCE_LEN);
+
+	wpaPrf(ptk, sizeof(ptk), targetNetwork->pmk, sizeof(targetNetwork->pmk), pad, sizeof(pad));
+	ptkReady = true;
+
+	logValue("Handshake 1 of 4, send : ", wpaSendKey(info, snonce, assocIe, assocIeLen));
+}
+
+static bool wpaInstallKey(bool group) {
+	if (!wmiCmd8(WMI_CMD_SYNCHRONIZE, 0) || !wmiBegin()) {
+		return false;
+	}
+
+	const u32 keyLen = group ? gtkLen : WPA_TK_LEN;
+	txBuf[WMI_BODY+0] = group ? gtkIndex : 0;
+	txBuf[WMI_BODY+1] = (keyLen > WPA_TK_LEN) ? WMI_CIPHER_TKIP : WMI_CIPHER_AES;
+	txBuf[WMI_BODY+2] = group ? WMI_KEY_USAGE_GROUP : 0;
+	txBuf[WMI_BODY+3] = keyLen;
+	if (group) {
+		txCopy(WMI_BODY + 4, groupRsc, sizeof(groupRsc));
+		txCopy(WMI_BODY + 12, gtk, 16);
+		if (keyLen > 16) {
+			// TKIP: the firmware wants the receive and transmit parts swapped
+			txCopy(WMI_BODY + 28, gtk + 24, 8);
+			txCopy(WMI_BODY + 36, gtk + 16, 8);
+		}
+	} else {
+		txCopy(WMI_BODY + 12, ptk + WPA_TK_OFFSET, WPA_TK_LEN);
+	}
+	txBuf[WMI_BODY+44] = WMI_KEY_OP_INIT_TSC_RSC;
+	if (!wmiSend(WMI_CMD_ADD_CIPHER_KEY, 45)) {
+		return false;
+	}
+
+	return wmiCmd8(WMI_CMD_SYNCHRONIZE, 0);
+}
+
+// Message 3 of 4: holds the group key, wrapped with our key encryption key
+static void wpaHandleMessage3(u32 key, u16 info, u32 dataLen) {
+	if (!sameBytes(htcBuf + key + EAPOL_KEY_NONCE, anonce, sizeof(anonce))) {
+		logValue("Handshake nonce changed : ", 1);
+		return;
+	}
+
+	gtkLen = 0;
+	for (u32 pos = 0; pos + 2 <= dataLen; pos += 2 + keyData[pos+1]) {
+		const u32 len = keyData[pos+1];
+		if (pos + 2 + len > dataLen) {
+			break;
+		}
+		if (keyData[pos] == 0xDD && len >= 6 + 16 && len - 6 <= sizeof(gtk) && keyData[pos+2] == 0x00
+		 && keyData[pos+3] == 0x0F && keyData[pos+4] == 0xAC && keyData[pos+5] == 0x01) {
+			gtkIndex = keyData[pos+6] & 3;
+			gtkLen = len - 6;
+			copyBytes(gtk, keyData + pos + 8, gtkLen);
+			break;
+		}
+	}
+	if (gtkLen == 0) {
+		logValue("Handshake group key missing : ", dataLen);
+		return;
+	}
+	copyBytes(groupRsc, htcBuf + key + EAPOL_KEY_RSC, sizeof(groupRsc));
+
+	logValue("Handshake 3 of 4, send : ", wpaSendKey(info, NULL, NULL, 0));
+	logValue("Pairwise key : ", wpaInstallKey(false));
+	logValue("Group key : ", wpaInstallKey(true));
+	wpaComplete = true;
+}
+
+static void wpaHandleData(void) {
+	const u32 end = HTC_HDR + htcPayloadLen;
+	u32 pos = HTC_HDR + 2; // Past the WMI data header
+	if (pos + 14 > end) {
+		return;
+	}
+
+	const u32 source = pos + 6;
+	u32 type = htcGetBe16(pos + 12);
+	pos += 14;
+	if (type < 0x600) {
+		if (pos + 8 > end) {
+			return;
+		}
+		type = htcGetBe16(pos + 6);
+		pos += 8; // LLC-SNAP
+	}
+	if (type != EAPOL_ETHERTYPE) {
+		dataFrames++;
+		return;
+	}
+
+	const u32 eapol = pos;
+	const u32 key = eapol + EAPOL_HDR;
+	if (wpaBusy || key + EAPOL_KEY_HDR > end) {
+		return;
+	}
+
+	const u16 info = htcGetBe16(key + EAPOL_KEY_INFO);
+	u32 dataLen = htcGetBe16(key + EAPOL_KEY_DATA_LEN);
+	if (htcBuf[key] != 2 || (info & EAPOL_INFO_VERSION) != 2 || !(info & EAPOL_INFO_ACK)
+	 || key + EAPOL_KEY_HDR + dataLen > end) {
+		logValue("EAPOL ignored : ", info);
+		return;
+	}
+
+	if (info & EAPOL_INFO_MIC) {
+		u8 mic[EAPOL_MIC_LEN];
+		u8 digest[WPA_SHA1_LEN];
+		if (!ptkReady) {
+			return;
+		}
+		copyBytes(mic, htcBuf + key + EAPOL_KEY_MIC, sizeof(mic));
+		clearBytes(htcBuf + key + EAPOL_KEY_MIC, sizeof(mic));
+		wpaHmacSha1(digest, ptk, WPA_KCK_LEN, htcBuf + eapol, EAPOL_HDR + EAPOL_KEY_HDR + dataLen);
+		if (!sameBytes(mic, digest, sizeof(mic))) {
+			logValue("EAPOL MIC wrong : ", info);
+			return;
+		}
+	}
+
+	const u8* replay = htcBuf + key + EAPOL_KEY_REPLAY;
+	if (eapolReplaySet && !bytesLess(eapolReplay, replay, sizeof(eapolReplay))) {
+		logValue("EAPOL replay : ", info);
+		return;
+	}
+	copyBytes(eapolReplay, replay, sizeof(eapolReplay));
+	eapolReplaySet = true;
+	eapolVersion = htcBuf[eapol];
+	copyBytes(apMac, htcBuf + source, sizeof(apMac));
+
+	if (dataLen && (info & EAPOL_INFO_ENCRYPTED)) {
+		if (dataLen < 16 || (dataLen & 7) || dataLen - 8 > sizeof(keyData)) {
+			logValue("EAPOL key data length : ", dataLen);
+			return;
+		}
+		dataLen -= 8;
+		if (!wpaAesUnwrap(ptk + WPA_KEK_OFFSET, htcBuf + key + EAPOL_KEY_HDR, keyData, dataLen/8)) {
+			logValue("EAPOL key data corrupt : ", dataLen);
+			return;
+		}
+	}
+
+	wpaBusy = true;
+	switch (info & (EAPOL_INFO_PAIRWISE | EAPOL_INFO_MIC)) {
+		case EAPOL_INFO_PAIRWISE:
+			wpaHandleMessage1(key, info);
+			break;
+		case EAPOL_INFO_PAIRWISE | EAPOL_INFO_MIC:
+			wpaHandleMessage3(key, info, dataLen);
+			break;
+		default:
+			logValue("EAPOL other : ", info);
+			break;
+	}
+	wpaBusy = false;
+}
+
+static void wmiHandleEvent(void) {
+	const u16 id = htcGet16(HTC_HDR);
+	switch (id) {
+		case WMI_EVENT_BSS_INFO:
+			handleBss();
+			break;
+		case WMI_EVENT_SCAN_COMPLETE:
+			logValue("Scan status : ", htcGet16(WMI_BODY));
+			scanDone = true;
+			break;
+		case WMI_EVENT_CHANNEL_LIST:
+			handleChannelList();
+			break;
+		case WMI_EVENT_CONNECTED:
+			handleConnected();
+			break;
+		case WMI_EVENT_DISCONNECTED:
+			logValue("Disconnected, reason : ", htcBuf[WMI_BODY+8]);
+			logValue("Disconnected, 802.11 reason : ", htcGet16(WMI_BODY));
+			wifiDisconnected = true;
+			break;
+		case WMI_EVENT_REG_DOMAIN:
+		case WMI_EVENT_EXTENSION:
+			break;
+		default:
+			logValue("Other WMI event : ", id);
+			break;
+	}
+}
+
+// Handles one message if there is one
+static bool wmiPump(void) {
+	if (!htcRecv()) {
+		return false;
+	}
+
+	if (htcBuf[0] == wmiEndpoint) {
+		wmiHandleEvent();
+	} else if (htcBuf[0] != 0 && htcPayloadLen != 0) {
+		wpaHandleData();
+	}
+	return true;
+}
+
+static bool wmiWaitFor(const bool* flag, int silentLimit) {
+	int silent = 0;
+	for (int i = 0; i < 2000 && !*flag && !wifiDisconnected && silent < silentLimit; i++) {
+		if (wmiPump()) {
+			silent = 0;
+		} else if (sdioError) {
+			return false;
+		} else {
 			silent++;
-			continue;
 		}
-		if (htcBuf[0] != wmiEndpoint) {
-			creditMessages++;
-			continue;
-		}
-		const u16 id = htcGet16(HTC_HDR);
-		if (id == event) {
-			return true;
-		}
-		logValue("Other WMI event : ", id);
 	}
-	return false;
+	return *flag;
 }
 
 static int wmiScan(void) {
+	if (!wmiCmd32(WMI_CMD_ERROR_REPORT, 0x7F)) return -48;
+	if (!wmiCmd32(WMI_CMD_SET_HB_TIMEOUT, 0)) return -49;
+
+	// Only the channels the firmware allows
+	if (!wmiCmd(WMI_CMD_GET_CHANNEL_LIST)) return -57;
+	if (!wmiWaitFor(&channelsReady, 8)) return -58;
+	logValue("Channels : ", channelCount);
+	if (channelCount == 0) return -59;
+
+	// Passive scan, everything else off
+	if (!wmiBegin() || !wmiSend(WMI_CMD_SET_PROBED_SSID, 35)) return -50;
+
+	if (!wmiBegin()) return -51;
+	txBuf[WMI_BODY+2] = WMI_PHY_11G;
+	txBuf[WMI_BODY+3] = channelCount;
+	for (u32 i = 0; i < channelCount; i++) {
+		txPut16(WMI_BODY + 4 + i*2, channels[i]);
+	}
+	if (!wmiSend(WMI_CMD_SET_CHANNEL_PARAMS, 4 + channelCount*2)) return -51;
+
+	if (!wmiBegin()) return -52;
+	txPut16(WMI_BODY+0, 0xFFFF); // Foreground start period
+	txPut16(WMI_BODY+2, 0xFFFF); // Foreground end period
+	txPut16(WMI_BODY+4, 0xFFFF); // Background period
+	txPut16(WMI_BODY+6, 105); // Max active dwell time
+	txPut16(WMI_BODY+8, 105); // Passive dwell time
+	txBuf[WMI_BODY+11] = WMI_SCAN_CONNECT;
+	txPut16(WMI_BODY+12, 105); // Min active dwell time
+	if (!wmiSend(WMI_CMD_SET_SCAN_PARAMS, 20)) return -52;
+
+	if (!wmiBegin()) return -53;
+	txBuf[WMI_BODY] = WMI_BSS_FILTER_ALL;
+	if (!wmiSend(WMI_CMD_SET_BSS_FILTER, 8)) return -53;
+
+	if (!wmiBegin()) return -54;
+	txPut32(WMI_BODY+8, 20); // Home dwell time
+	if (!wmiSend(WMI_CMD_START_SCAN, 18)) return -54;
+
+	const bool finished = wmiWaitFor(&scanDone, 30);
+	logValue("Scan results : ", scanResults);
+	if (sdioError) return -55;
+	return finished ? 0 : -56;
+}
+
+// Stops scanning and asks the firmware to join the network, as Calico does
+static int wmiConnect(void) {
+	if (!wmiBegin() || !wmiSend(WMI_CMD_SET_BSS_FILTER, 8)) return -62;
+	if (!wmiBegin() || !wmiSend(WMI_CMD_SET_PROBED_SSID, 35)) return -63;
+
+	if (!wmiBegin()) return -64;
+	txPut16(WMI_BODY+0, 0xFFFF);
+	txPut16(WMI_BODY+2, 0xFFFF);
+	txPut16(WMI_BODY+4, 0xFFFF);
+	txPut16(WMI_BODY+6, 200);
+	txPut16(WMI_BODY+8, 200);
+	txBuf[WMI_BODY+11] = WMI_SCAN_CONNECT | WMI_SCAN_ACTIVE | WMI_SCAN_ROAM;
+	txPut16(WMI_BODY+12, 200);
+	if (!wmiSend(WMI_CMD_SET_SCAN_PARAMS, 20)) return -64;
+
+	if (!wmiBegin()) return -65;
+	txBuf[WMI_BODY+2] = WMI_PHY_11G;
+	if (!wmiSend(WMI_CMD_SET_CHANNEL_PARAMS, 4)) return -65;
+
+	if (!wmiBegin()) return -66;
+	txBuf[WMI_BODY+0] = 0xFF; // Automatic data rate
+	if (!wmiSend(WMI_CMD_SET_BIT_RATE, 3)) return -66;
+
+	if (!wmiBegin()) return -67;
+	txBuf[WMI_BODY+0] = 1;
+	txBuf[WMI_BODY+1] = 4 | (10 << 4); // PS-Poll
+	txPut16(WMI_BODY+2, 0xFFF7); // Everything but 11 Mbps
+	if (!wmiSend(WMI_CMD_SET_FRAME_RATE, 4)) return -67;
+
+	wmiCmd8(WMI_CMD_SYNCHRONIZE, 0);
+	if (!wmiCmd8(WMI_CMD_SET_POWER_MODE, WMI_POWER_MAX_PERFORMANCE)) return -68;
+	wmiCmd8(WMI_CMD_SYNCHRONIZE, 0);
+
+	if (!wmiBegin()) return -69;
+	txPut32(WMI_BODY+0, 20); // Min and max service interval
+	txPut32(WMI_BODY+4, 20);
+	txPut32(WMI_BODY+8, 9999999); // Inactivity
+	txPut32(WMI_BODY+12, 0xFFFFFFFF); // Suspension
+	txPut32(WMI_BODY+20, 83200); // Min, mean and peak data rate
+	txPut32(WMI_BODY+24, 83200);
+	txPut32(WMI_BODY+28, 83200);
+	txPut32(WMI_BODY+40, 6000000); // Min PHY rate
+	txPut32(WMI_BODY+44, 0x2000); // Surplus bandwidth allowance
+	txPut16(WMI_BODY+52, 0x80D0); // Nominal MSDU
+	txPut16(WMI_BODY+54, 0x00D0); // Max MSDU
+	txBuf[WMI_BODY+57] = 2; // Both directions
+	txBuf[WMI_BODY+58] = 0xFF; // RX queue
+	txBuf[WMI_BODY+59] = 1; // Periodic
+	txBuf[WMI_BODY+61] = 5; // TSID
+	if (!wmiSend(WMI_CMD_CREATE_PSTREAM, 63)) return -69;
+
+	if (!wmiCmd8(WMI_CMD_SET_WSC_STATUS, 0)) return -70;
+	if (!wmiCmd8(WMI_CMD_SET_DISC_TIMEOUT, 2)) return -71;
+	if (!wmiCmd8(WMI_CMD_SET_KEEP_ALIVE, 0)) return -72;
+
+	if (!wmiBegin()) return -73;
+	txBuf[WMI_BODY+0] = 1; // Infrastructure
+	txBuf[WMI_BODY+1] = 1; // Open system authentication
+	txBuf[WMI_BODY+2] = WMI_AUTH_WPA2_PSK;
+	txBuf[WMI_BODY+3] = WMI_CIPHER_AES;
+	txBuf[WMI_BODY+5] = (targetGroupCipher == 2) ? WMI_CIPHER_TKIP : WMI_CIPHER_AES;
+	txBuf[WMI_BODY+7] = targetNetwork->ssidLen;
+	txCopy(WMI_BODY + 8, targetNetwork->ssid, targetNetwork->ssidLen);
+	txPut16(WMI_BODY+40, targetMhz);
+	txCopy(WMI_BODY + 42, targetBssid, sizeof(targetBssid));
+	if (!wmiSend(WMI_CMD_CONNECT, 52)) return -73;
+
+	if (!wmiWaitFor(&wifiAssociated, 40)) return wifiDisconnected ? -74 : -75;
+	if (!wmiWaitFor(&wpaComplete, 40)) return wifiDisconnected ? -76 : -77;
+	logValue("WPA2 handshake complete : ", 1);
+
+	// Encrypted traffic from the router shows the keys work
+	for (int silent = 0, i = 0; i < 300 && silent < 8 && !wifiDisconnected; i++) {
+		if (wmiPump()) {
+			silent = 0;
+		} else if (sdioError) {
+			break;
+		} else {
+			silent++;
+		}
+	}
+	logValue("Data frames : ", dataFrames);
+	logValue("Still connected : ", !wifiDisconnected);
+
+	wmiCmd(WMI_CMD_DISCONNECT);
+	return wifiDisconnected ? -78 : 0;
+}
+
+static int htcHandshake(void) {
+	if (!htcRecv()) return -41;
+	if (htcBuf[0] != 0 || htcGet16(HTC_HDR) != HTC_MSG_READY) return -42;
+	htcCredits = htcGet16(HTC_HDR+2);
+	logValue("HTC credits : ", htcCredits);
+	logValue("HTC credit size : ", htcGet16(HTC_HDR+4));
+
+	wmiEndpoint = htcConnect(HTC_SRV_WMI_CONTROL, 0);
+	if (wmiEndpoint == 0) return -43;
+	logValue("WMI endpoint : ", wmiEndpoint);
+	for (u16 service = HTC_SRV_WMI_DATA_BE; service <= HTC_SRV_WMI_DATA_VO; service++) {
+		const u8 endpoint = htcConnect(service, HTC_FLAGS_WMI_DATA);
+		if (endpoint == 0) return -44;
+		if (service == HTC_SRV_WMI_DATA_BE) {
+			wmiDataEndpoint = endpoint;
+		}
+	}
+	logValue("WMI data endpoint : ", wmiDataEndpoint);
+
+	txClear();
+	txPut16(HTC_HDR, HTC_MSG_SETUP_COMPLETE);
+	if (!htcSend(HTC_HDR + 2)) return -45;
+
+	for (int i = 0; ; i++) {
+		if (i == 8) return -47;
+		if (!htcRecv()) return -46;
+		if (htcBuf[0] == wmiEndpoint && htcGet16(HTC_HDR) == WMI_EVENT_READY) {
+			break;
+		}
+		logValue("Other message : ", htcWords[0]);
+	}
+	copyBytes(selfMac, htcBuf + WMI_BODY, sizeof(selfMac));
+	logValue("MAC high : ", (selfMac[0] << 16) | (selfMac[1] << 8) | selfMac[2]);
+	logValue("MAC low : ", (selfMac[3] << 16) | (selfMac[4] << 8) | selfMac[5]);
+	logValue("PHY capability : ", htcBuf[WMI_BODY+6]);
+
 	// The firmware ignores WMI commands until the host reports its protocol
 	// version, at the address held in the first host interest word
 	const u32 appHostInterest = readInternWord53(hostInterestAddr);
@@ -820,118 +1584,28 @@ static int wmiScan(void) {
 	writeInternWord53(appHostInterest, WMI_PROTOCOL_VERSION);
 	if (sdioError) return -61;
 
-	if (!wmiSendParam32(WMI_CMD_ERROR_REPORT, 0x7F)) return -48;
-	if (!wmiSendParam32(WMI_CMD_SET_HB_TIMEOUT, 0)) return -49;
+	readSavedNetworks();
 
-	// Only the channels the firmware allows
-	htcClear();
-	if (!wmiSend(WMI_CMD_GET_CHANNEL_LIST, 0)) return -57;
-	if (!wmiWaitEvent(WMI_CMD_GET_CHANNEL_LIST)) {
-		logValue("Credit messages : ", creditMessages);
-		return -58;
-	}
-	logValue("Credit messages : ", creditMessages);
-	u16 channels[14];
-	u32 channelCount = 0;
-	for (u32 i = 0; i < htcBuf[WMI_BODY+1] && channelCount < 14; i++) {
-		const u16 mhz = htcGet16(WMI_BODY + 2 + i*2);
-		if (mhz < 3000) {
-			channels[channelCount++] = mhz;
-		}
-	}
-	logValue("Channels : ", channelCount);
-	if (channelCount == 0) return -59;
+	const int scan = wmiScan();
+	if (scan != 0) return scan;
+	if (targetNetwork == NULL) return -79;
 
-	// Passive scan, everything else off
-	htcClear();
-	if (!wmiSend(WMI_CMD_SET_PROBED_SSID, 35)) return -50;
-
-	htcClear();
-	htcBuf[WMI_BODY+2] = WMI_PHY_11G;
-	htcBuf[WMI_BODY+3] = channelCount;
-	for (u32 i = 0; i < channelCount; i++) {
-		htcPut16(WMI_BODY + 4 + i*2, channels[i]);
-	}
-	if (!wmiSend(WMI_CMD_SET_CHANNEL_PARAMS, 4 + channelCount*2)) return -51;
-
-	htcClear();
-	htcPut16(WMI_BODY+0, 0xFFFF); // Foreground start period
-	htcPut16(WMI_BODY+2, 0xFFFF); // Foreground end period
-	htcPut16(WMI_BODY+4, 0xFFFF); // Background period
-	htcPut16(WMI_BODY+6, 105); // Max active dwell time
-	htcPut16(WMI_BODY+8, 105); // Passive dwell time
-	htcBuf[WMI_BODY+11] = WMI_SCAN_CONNECT;
-	htcPut16(WMI_BODY+12, 105); // Min active dwell time
-	if (!wmiSend(WMI_CMD_SET_SCAN_PARAMS, 20)) return -52;
-
-	htcClear();
-	htcBuf[WMI_BODY] = WMI_BSS_FILTER_ALL;
-	if (!wmiSend(WMI_CMD_SET_BSS_FILTER, 8)) return -53;
-
-	htcClear();
-	htcPut32(WMI_BODY+8, 20); // Home dwell time
-	if (!wmiSend(WMI_CMD_START_SCAN, 18)) return -54;
-
-	int silent = 0;
-	int results = 0;
-	for (int i = 0; i < 400 && silent < 30; i++) {
-		if (!htcRecv()) {
-			if (sdioError) return -55;
-			silent++;
-			continue;
-		}
-		silent = 0;
-		if (htcBuf[0] != wmiEndpoint) {
-			creditMessages++;
-			continue;
-		}
-		const u16 id = htcGet16(HTC_HDR);
-		if (id == WMI_EVENT_BSS_INFO) {
-			if (results < 24) {
-				logBss(htcGet16(2));
-			}
-			results++;
-		} else if (id == WMI_EVENT_SCAN_COMPLETE) {
-			logValue("Scan results : ", results);
-			logValue("Scan status : ", htcGet16(WMI_BODY) | (htcGet16(WMI_BODY+2) << 16));
-			return 0;
-		} else {
-			logValue("Other WMI event : ", id);
-		}
-	}
-	logValue("Scan results : ", results);
-	return -56;
+	const int connect = wmiConnect();
+	logValue("Credits left : ", htcCredits);
+	return connect;
 }
 
-static int htcHandshake(void) {
-	if (!htcRecv()) return -41;
-	if (htcBuf[0] != 0 || htcGet16(HTC_HDR) != HTC_MSG_READY) return -42;
-	logValue("HTC credits : ", htcGet16(HTC_HDR+2));
-	logValue("HTC credit size : ", htcGet16(HTC_HDR+4));
-
-	wmiEndpoint = htcConnect(HTC_SRV_WMI_CONTROL, 0);
-	if (wmiEndpoint == 0) return -43;
-	logValue("WMI endpoint : ", wmiEndpoint);
-	for (u16 service = HTC_SRV_WMI_DATA_BE; service <= HTC_SRV_WMI_DATA_VO; service++) {
-		if (htcConnect(service, HTC_FLAGS_WMI_DATA) == 0) return -44;
-	}
-
-	htcClear();
-	htcPut16(HTC_HDR, HTC_MSG_SETUP_COMPLETE);
-	if (!htcSend(HTC_HDR + 2)) return -45;
-
-	for (int i = 0; i < 8; i++) {
-		if (!htcRecv()) return -46;
-		if (htcBuf[0] == wmiEndpoint && htcGet16(HTC_HDR) == WMI_EVENT_READY) {
-			const u8* mac = htcBuf + HTC_HDR + 2;
-			logValue("MAC high : ", (mac[0] << 16) | (mac[1] << 8) | mac[2]);
-			logValue("MAC low : ", (mac[3] << 16) | (mac[4] << 8) | mac[5]);
-			logValue("PHY capability : ", mac[6]);
-			return wmiScan();
-		}
-		logValue("Other message : ", htcWords[0]);
-	}
-	return -47;
+// Nothing secret stays in memory once the test is over
+static void wifiClearSecrets(void) {
+	clearBytes((u8*)savedNetworks, sizeof(savedNetworks));
+	clearBytes(ptk, sizeof(ptk));
+	clearBytes(gtk, sizeof(gtk));
+	clearBytes(keyData, sizeof(keyData));
+	clearBytes(anonce, sizeof(anonce));
+	clearBytes(htcBuf, sizeof(htcWords));
+	clearBytes(txBuf, sizeof(txWords));
+	targetNetwork = NULL;
+	ptkReady = false;
 }
 
 // Soft resets the chip, keeping the firmware the system loaded, and restarts it,
@@ -1008,6 +1682,7 @@ static int startFirmware(void) {
 
 	hostInterestAddr = hostInterest;
 	const int ret = htcHandshake();
+	wifiClearSecrets();
 
 	// Release the radio for the game with a fresh start. The game's WiFi search
 	// locks up if the chip is left in its bootloader, so firmware has to be running
