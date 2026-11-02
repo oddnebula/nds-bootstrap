@@ -57,6 +57,7 @@
 
 #define STAT0_CMDRESPEND	0x0001
 #define STAT0_DATAEND		0x0004
+#define SDIO_BLOCK		128
 #define STAT1_RXRDY		0x0100
 #define STAT1_TXRQ		0x0200
 #define STAT1_CMD_BUSY		0x4000
@@ -229,6 +230,63 @@ static bool cmd53(bool write, u32 addr, u32* data, u32 len) {
 
 	sdioWrite16(SDIO_IRQ_STAT0, 0);
 	sdioWrite16(SDIO_IRQ_STAT1, 0);
+	if (!ok) {
+		if (!sdioFirstErrCmd) {
+			sdioFirstErrCmd = cmd;
+			sdioFirstErrArg = arg;
+			sdioFirstErrStat = stat1;
+		}
+		sdioError = true;
+	}
+	return ok;
+}
+
+// Block mode write. Messages longer than a block have to arrive as one transfer.
+static bool cmd53WriteBlocks(u32 addr, const u32* data, u32 blocks) {
+	int i;
+	for (i = 0; i < TIMEOUT && (sdioRead16(SDIO_IRQ_STAT1) & STAT1_CMD_BUSY); i++);
+	if (i == TIMEOUT) {
+		sdioError = true;
+		return false;
+	}
+
+	const u32 arg = BIT(31) | (1 << 28) | BIT(27) | BIT(26) | ((addr & 0x1FFFF) << 9) | blocks;
+	const u16 cmd = CMD53_WRITE | ((blocks > 1) ? BIT(13) : 0);
+	sdioWrite16(SDIO_IRQ_STAT0, 0);
+	sdioWrite16(SDIO_IRQ_STAT1, 0);
+	sdioWrite16(SDIO_STOP, 0x100);
+	sdioWrite16(SDIO_CMD_PARAM0, arg & 0xFFFF);
+	sdioWrite16(SDIO_CMD_PARAM1, arg >> 16);
+	sdioWrite16(SDIO_DATA16_BLK_LEN, SDIO_BLOCK);
+	sdioWrite16(SDIO_DATA16_BLK_CNT, blocks);
+	sdioWrite16(SDIO_DATA32_BLK_LEN, SDIO_BLOCK);
+	sdioWrite16(SDIO_DATA32_BLK_CNT, blocks);
+	sdioWrite16(SDIO_CMD, cmd);
+
+	u32 sent = 0;
+	bool ok = false;
+	u16 stat1 = 0;
+	for (i = 0; i < TIMEOUT; i++) {
+		stat1 = sdioRead16(SDIO_IRQ_STAT1);
+		if (stat1 & STAT1_ERR) {
+			break;
+		}
+		if (sent < blocks && (stat1 & STAT1_TXRQ)) {
+			sdioMask16(SDIO_IRQ_STAT1, STAT1_TXRQ, 0);
+			for (u32 w = 0; w < SDIO_BLOCK/sizeof(u32); w++) {
+				*(vu32*)(SDIO_BASE + SDIO_DATA32_FIFO) = *data++;
+			}
+			sent++;
+		}
+		if (sent == blocks && (sdioRead16(SDIO_IRQ_STAT0) & STAT0_DATAEND)) {
+			ok = true;
+			break;
+		}
+	}
+
+	sdioWrite16(SDIO_IRQ_STAT0, 0);
+	sdioWrite16(SDIO_IRQ_STAT1, 0);
+	sdioWrite16(SDIO_STOP, 0x100);
 	if (!ok) {
 		if (!sdioFirstErrCmd) {
 			sdioFirstErrCmd = cmd;
@@ -580,12 +638,7 @@ static void logText(const char* name, const u8* text, u32 len) {
 static bool htcSend(u32 payloadLen) {
 	txPut16(2, payloadLen);
 	const u32 len = (HTC_HDR + payloadLen + HTC_BLOCK - 1) & ~(HTC_BLOCK - 1);
-	for (u32 done = 0; done < len; done += CMD53_MAX_LEN) {
-		if (!cmd53(true, 0x1000 - len + done, txWords + done/sizeof(u32), CMD53_MAX_LEN)) {
-			return false;
-		}
-	}
-	return true;
+	return cmd53WriteBlocks(0x1000 - len, txWords, len / HTC_BLOCK);
 }
 
 // Takes the payload length and any credits out of a received message
