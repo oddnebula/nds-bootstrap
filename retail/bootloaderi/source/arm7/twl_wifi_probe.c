@@ -52,7 +52,6 @@
 #define STAT1_ERR		0x807F // ILL_ACCESS, CMDTIMEOUT, TXUNDERRUN, RXOVERFLOW, DATATIMEOUT, STOPBIT_ERR, CRCFAIL, CMD_IDX_ERR
 
 // Command register values (index | response type << 8)
-#define CMD0	(0  | (3 << 8)) // GO_IDLE_STATE, no response
 #define CMD3	(3  | (4 << 8)) // SEND_RELATIVE_ADDR, 48-bit response
 #define CMD5	(5  | (7 << 8)) // IO_SEND_OP_COND, 48-bit OCR response, no CRC7
 #define CMD7	(7  | (5 << 8)) // SELECT_CARD, 48-bit response with busy
@@ -77,12 +76,9 @@
 static u32 sdioResp = 0;
 static u16 sdioRca = 0;
 static bool sdioError = false;
-static bool readOnly = false;
 static u16 sdioFirstErrCmd = 0;
 static u32 sdioFirstErrArg = 0;
 static u16 sdioFirstErrStat = 0;
-static bool cardInitSkipped = false;
-static bool functionToggled = false;
 
 static inline u16 sdioRead16(u32 reg) {
 	return *(vu16*)(SDIO_BASE + reg);
@@ -312,13 +308,6 @@ static int probe(twlWifiProbeResult* result) {
 
 	sdioWrite16(SDIO_STOP, 0x100);
 
-	// The card ignores CMD5 after a warm start unless this comes first
-	if (readOnly) {
-		sdioCommand(CMD0, 0);
-		sdioError = false;
-		swiDelay(0xF000);
-	}
-
 	// CMD5 until the card reports it's ready
 	u32 ocr = 0;
 	bool skipInit = false;
@@ -328,7 +317,6 @@ static int probe(twlWifiProbeResult* result) {
 			// Already initialized (e.g. by the system menu)
 			sdioError = false;
 			skipInit = true;
-			cardInitSkipped = true;
 			break;
 		}
 		ocr = sdioResp & 0xFFFFFF;
@@ -346,54 +334,30 @@ static int probe(twlWifiProbeResult* result) {
 		if (!sdioCommand(CMD7, (u32)sdioRca << 16)) return -3;
 	}
 
-	if (!readOnly) {
-		cmd52Write(0, 0x02, 0x00);
-		cmd52Write(0, 0x02, 0x02);
-		swiDelay(0xF000);
-	}
+	cmd52Write(0, 0x02, 0x00);
+	cmd52Write(0, 0x02, 0x02);
+	swiDelay(0xF000);
 
-	if (!readOnly) {
-		// Bus Interface Control: 4-bit mode and card detect
-		const u8 busControl = cmd52Read(0, 0x07);
-		if (sdioError) return -4;
-		if (!cmd52Write(0, 0x07, busControl | 0x82)) return -5;
-		sdioSetBusWidth(4);
+	// Bus Interface Control: 4-bit mode and card detect
+	const u8 busControl = cmd52Read(0, 0x07);
+	if (sdioError) return -4;
+	if (!cmd52Write(0, 0x07, busControl | 0x82)) return -5;
+	sdioSetBusWidth(4);
 
-		cmd52Write(0, 0x12, 0x02); // Power Control
-		cmd52Write(0, 0x110, 128); // Function 1 block size
-		cmd52Write(0, 0x111, 0);
-		cmd52Write(0, 0x10, 128); // Function 0 block size
-		cmd52Write(0, 0x11, 0);
-		if (sdioError) return -6;
-		swiDelay(0xF000);
-	}
+	cmd52Write(0, 0x12, 0x02); // Power Control
+	cmd52Write(0, 0x110, 128); // Function 1 block size
+	cmd52Write(0, 0x111, 0);
+	cmd52Write(0, 0x10, 128); // Function 0 block size
+	cmd52Write(0, 0x11, 0);
+	if (sdioError) return -6;
+	swiDelay(0xF000);
 
 	result->sdioRevision = cmd52Read(0, 0x00);
-
-	if (readOnly) {
-		result->ioEnable = cmd52Read(0, 0x02);
-		result->ioReady = cmd52Read(0, 0x03);
-		result->busControl = cmd52Read(0, 0x07);
-	}
 
 	// Enable function 1 and wait until it's ready
 	cmd52Write(0, 0x02, 0x02);
 	for (i = 0; i < 0x10000 && !sdioError && cmd52Read(0, 0x03) != 0x02; i++);
 	if (i == 0x10000 || sdioError) return -7;
-
-	// A chip left running by the system may not answer on function 1 until
-	// the function is toggled
-	if (readOnly) {
-		cmd52Read(1, F1_RX_LOOKAHEAD_VALID);
-		if (sdioError) {
-			sdioError = false;
-			functionToggled = true;
-			cmd52Write(0, 0x02, 0x00);
-			cmd52Write(0, 0x02, 0x02);
-			for (i = 0; i < 0x10000 && !sdioError && cmd52Read(0, 0x03) != 0x02; i++);
-			if (i == 0x10000 || sdioError) return -11;
-		}
-	}
 
 	result->manufacturer = read32(0, 0x1007);
 	result->chipId = readInternWord(0x000040EC);
@@ -403,10 +367,6 @@ static int probe(twlWifiProbeResult* result) {
 	result->boardData = readInternWord(hostInterest + 0x54);
 	result->firmwareRam = readInternWord(0x00524C00);
 	if (sdioError) return -8;
-
-	if (readOnly) {
-		return 0;
-	}
 
 	// Reset into the bootloader and ask for its version
 	writeInternWord(0x4000, 0x00000100);
@@ -428,6 +388,7 @@ static void resetResult(twlWifiProbeResult* result) {
 	result->firmwareRam = 0;
 	result->resetCause = 0;
 	result->bmiVersion = 0;
+	result->irqEnable = 0;
 	result->ioEnable = 0;
 	result->ioReady = 0;
 	result->busControl = 0;
@@ -435,19 +396,47 @@ static void resetResult(twlWifiProbeResult* result) {
 	sdioFirstErrCmd = 0;
 	sdioFirstErrArg = 0;
 	sdioFirstErrStat = 0;
-	cardInitSkipped = false;
-	functionToggled = false;
 }
 
-// Looks at the chip as it was left by whatever ran before us. Doesn't touch the
-// LED/reset register or the chip's CPU, and leaves the card initialized. Function
-// 1 is only toggled if it doesn't answer.
+// Reads the state of a chip the system already set up, in the order official
+// code does it: a register read at the slow identification clock decides if the
+// card needs bootup at all. Nothing here reinitializes or reconfigures the card.
+static int probeWarm(twlWifiProbeResult* result) {
+	sdioControllerInit();
+	sdioMask16(SDIO_PORT_SEL, 3, 0);
+	sdioMask16(SDIO_CLK_CNT, 0x100, 0);
+	sdioMask16(SDIO_CLK_CNT, 0x2FF, 0x40); // HCLK/256
+	sdioMask16(SDIO_CLK_CNT, 0, 0x100);
+	sdioMask16(SDIO_CARD_OPT, 0, BIT(15)); // 1-bit
+	swiDelay(0xF000);
+
+	result->irqEnable = cmd52Read(0, 0x04);
+	if (sdioError) return -12; // Needs bootup, so it isn't warm
+
+	result->sdioRevision = cmd52Read(0, 0x00);
+	result->ioEnable = cmd52Read(0, 0x02);
+	result->ioReady = cmd52Read(0, 0x03);
+	result->busControl = cmd52Read(0, 0x07);
+	result->manufacturer = read32(0, 0x1007);
+	if (sdioError) return -13;
+
+	result->chipId = readInternWord(0x000040EC);
+	if (sdioError) return -14;
+	const u32 hostInterest = (result->chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
+	result->firmwareUploaded = readInternWord(hostInterest + 0x58);
+	result->hostInterest0 = readInternWord(hostInterest);
+	result->boardData = readInternWord(hostInterest + 0x54);
+	result->firmwareRam = readInternWord(0x00524C00);
+	if (sdioError) return -15;
+
+	return 0;
+}
+
 void twlWifiEarlyCheck(void) {
 	dbg_printf("twlWifiEarlyCheck:\n");
 
 	twlWifiProbeResult result;
 	resetResult(&result);
-	readOnly = true;
 
 	const u16 oldGpioWifi = REG_GPIO_WIFI;
 	logValue("GPIO_WIFI : ", oldGpioWifi);
@@ -461,15 +450,12 @@ void twlWifiEarlyCheck(void) {
 	sdioSave(sdioSaved, &sdioSavedIrqMask);
 
 	REG_GPIO_WIFI &= ~BIT(8); // Select Atheros
-	const int ret = probe(&result);
+	const int ret = probeWarm(&result);
 	sdioRestore(sdioSaved, sdioSavedIrqMask);
 	REG_GPIO_WIFI = oldGpioWifi;
 
-	readOnly = false;
-
 	logValue("Result : ", (u32)ret);
-	logValue("Card init skipped : ", cardInitSkipped);
-	logValue("Function toggled : ", functionToggled);
+	logValue("IRQ enable : ", result.irqEnable);
 	logValue("SDIO revision : ", result.sdioRevision);
 	logValue("Function enable : ", result.ioEnable);
 	logValue("Function ready : ", result.ioReady);

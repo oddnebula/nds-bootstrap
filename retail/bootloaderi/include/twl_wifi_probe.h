@@ -13,6 +13,7 @@ typedef struct {
 	u32 firmwareRam;
 	u32 resetCause;
 	u32 bmiVersion;
+	u8 irqEnable;
 	u8 ioEnable;
 	u8 ioReady;
 	u8 busControl;
