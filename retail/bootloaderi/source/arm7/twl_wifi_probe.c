@@ -628,6 +628,9 @@ void twlWifiEarlyCheck(void) {
 #define HTC_FLAGS_WMI_DATA	5 // Reduce credit dribble, threshold 0.5
 #define WMI_EVENT_READY		0x1001
 
+#define WMI_CMD_GET_CHANNEL_LIST 0x000E
+#define WMI_CMD_ERROR_REPORT	0x0022
+#define WMI_CMD_SET_HB_TIMEOUT	0x0047
 #define WMI_CMD_START_SCAN	0x0007
 #define WMI_CMD_SET_SCAN_PARAMS	0x0008
 #define WMI_CMD_SET_BSS_FILTER	0x0009
@@ -773,18 +776,62 @@ static void logBss(u32 payloadLen) {
 	dbg_printf(rsn ? " Security : WPA2\n" : wpa ? " Security : WPA\n" : privacy ? " Security : WEP\n" : " Security : Open\n");
 }
 
+static bool wmiSendParam32(u16 id, u32 val) {
+	htcClear();
+	htcPut32(WMI_BODY, val);
+	return wmiSend(id, sizeof(u32));
+}
+
+// Waits for an event, logging anything else from the firmware
+static bool wmiWaitEvent(u16 event) {
+	for (int silent = 0; silent < 8;) {
+		if (!htcRecv()) {
+			if (sdioError) return false;
+			silent++;
+			continue;
+		}
+		if (htcBuf[0] != wmiEndpoint) {
+			continue; // Credit reports
+		}
+		const u16 id = htcGet16(HTC_HDR);
+		if (id == event) {
+			return true;
+		}
+		logValue("Other WMI event : ", id);
+	}
+	return false;
+}
+
 static int wmiScan(void) {
-	// Passive scan of the 2.4 GHz channels, everything else off
+	if (!wmiSendParam32(WMI_CMD_ERROR_REPORT, 0x7F)) return -48;
+	if (!wmiSendParam32(WMI_CMD_SET_HB_TIMEOUT, 0)) return -49;
+
+	// Only the channels the firmware allows
+	htcClear();
+	if (!wmiSend(WMI_CMD_GET_CHANNEL_LIST, 0)) return -57;
+	if (!wmiWaitEvent(WMI_CMD_GET_CHANNEL_LIST)) return -58;
+	u16 channels[14];
+	u32 channelCount = 0;
+	for (u32 i = 0; i < htcBuf[WMI_BODY+1] && channelCount < 14; i++) {
+		const u16 mhz = htcGet16(WMI_BODY + 2 + i*2);
+		if (mhz < 3000) {
+			channels[channelCount++] = mhz;
+		}
+	}
+	logValue("Channels : ", channelCount);
+	if (channelCount == 0) return -59;
+
+	// Passive scan, everything else off
 	htcClear();
 	if (!wmiSend(WMI_CMD_SET_PROBED_SSID, 35)) return -50;
 
 	htcClear();
 	htcBuf[WMI_BODY+2] = WMI_PHY_11G;
-	htcBuf[WMI_BODY+3] = 13;
-	for (u32 i = 0; i < 13; i++) {
-		htcPut16(WMI_BODY + 4 + i*2, 2412 + i*5);
+	htcBuf[WMI_BODY+3] = channelCount;
+	for (u32 i = 0; i < channelCount; i++) {
+		htcPut16(WMI_BODY + 4 + i*2, channels[i]);
 	}
-	if (!wmiSend(WMI_CMD_SET_CHANNEL_PARAMS, 4 + 13*2)) return -51;
+	if (!wmiSend(WMI_CMD_SET_CHANNEL_PARAMS, 4 + channelCount*2)) return -51;
 
 	htcClear();
 	htcPut16(WMI_BODY+0, 0xFFFF); // Foreground start period
@@ -806,7 +853,7 @@ static int wmiScan(void) {
 
 	int silent = 0;
 	int results = 0;
-	for (int i = 0; i < 200 && silent < 6; i++) {
+	for (int i = 0; i < 400 && silent < 30; i++) {
 		if (!htcRecv()) {
 			if (sdioError) return -55;
 			silent++;
@@ -929,7 +976,13 @@ static int startFirmware(void) {
 	logValue("EEPROM version : ", readInternWord53(boardData + 0x10));
 	if (sdioError) return -38;
 
-	return htcHandshake();
+	const int ret = htcHandshake();
+
+	// Release the radio for the game: back to the bootloader, firmware kept
+	sdioError = false;
+	writeInternWord53(0x00004000, 0x00000100);
+	swiDelay(0x80000);
+	return ret;
 }
 
 void twlWifiStartFirmware(void) {
