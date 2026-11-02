@@ -390,7 +390,9 @@ static void warmControllerInit(void) {
 #define WMI_KEY_USAGE_GROUP	1
 #define WMI_KEY_OP_INIT_TSC_RSC	3
 
-#define CMD53_MAX_LEN		256
+// Byte mode transfers can't go past the function's block size
+#define CMD53_MAX_LEN		HTC_BLOCK
+#define HTC_MAX_SEND		256
 #define WMI_BODY		(HTC_HDR + 2)
 
 // The last received message
@@ -398,7 +400,7 @@ static u32 htcWords[HTC_MAX_PACKET/sizeof(u32)];
 #define htcBuf ((u8*)htcWords)
 
 // The message being built. Separate, since waiting for a credit receives messages
-static u32 txWords[CMD53_MAX_LEN/sizeof(u32)];
+static u32 txWords[HTC_MAX_SEND/sizeof(u32)];
 #define txBuf ((u8*)txWords)
 
 static u32 htcPayloadLen = 0; // Without the trailer
@@ -449,6 +451,8 @@ static u32 dataFrames = 0;
 
 // WPA2 handshake state
 #define EAPOL_ETHERTYPE		0x888E
+#define EAPOL_VERSION		1
+#define WMI_DATA_INFO_VOICE	(7 << 2) // Highest user priority, for EAPOL
 #define EAPOL_HDR		4
 #define EAPOL_KEY_HDR		95
 #define EAPOL_KEY_INFO		1
@@ -478,10 +482,11 @@ static u32 dataFrames = 0;
 static u8 apMac[6];
 static u8 assocIe[64];
 static u32 assocIeLen = 0;
-static u8 eapolVersion = 0;
-static u8 eapolReplay[EAPOL_REPLAY_LEN];
-static bool eapolReplaySet = false;
+static u8 eapolReplay[EAPOL_REPLAY_LEN]; // Repeated in the reply
+static u8 verifiedReplay[EAPOL_REPLAY_LEN]; // From the last message with a good MIC
+static bool verifiedReplaySet = false;
 static u8 anonce[EAPOL_NONCE_LEN];
+static u8 snonce[EAPOL_NONCE_LEN];
 static u8 ptk[WPA_PTK_LEN];
 static bool ptkReady = false;
 static u8 gtk[32];
@@ -571,7 +576,12 @@ static void logText(const char* name, const u8* text, u32 len) {
 static bool htcSend(u32 payloadLen) {
 	txPut16(2, payloadLen);
 	const u32 len = (HTC_HDR + payloadLen + HTC_BLOCK - 1) & ~(HTC_BLOCK - 1);
-	return cmd53(true, 0x1000 - len, txWords, len);
+	for (u32 done = 0; done < len; done += CMD53_MAX_LEN) {
+		if (!cmd53(true, 0x1000 - len + done, txWords + done/sizeof(u32), CMD53_MAX_LEN)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 // Takes the payload length and any credits out of a received message
@@ -852,7 +862,7 @@ static bool wpaSendKey(u16 rxInfo, const u8* nonce, const u8* data, u32 dataLen)
 	const u8 snap[8] = {0xAA, 0xAA, 0x03, 0, 0, 0, EAPOL_ETHERTYPE >> 8, EAPOL_ETHERTYPE & 0xFF};
 	txCopy(llc, snap, sizeof(snap));
 
-	txBuf[eapol] = eapolVersion;
+	txBuf[eapol] = EAPOL_VERSION;
 	txBuf[eapol+1] = 3; // EAPOL-Key
 	txPutBe16(eapol + 2, bodyLen);
 
@@ -874,6 +884,7 @@ static bool wpaSendKey(u16 rxInfo, const u8* nonce, const u8* data, u32 dataLen)
 
 	txBuf[0] = wmiDataEndpoint;
 	txBuf[1] = HTC_FLAG_NEED_CREDIT_UPDATE;
+	txBuf[HTC_HDR+1] = WMI_DATA_INFO_VOICE;
 	htcCredits--;
 	return htcSend(2 + 14 + 8 + EAPOL_HDR + bodyLen);
 }
@@ -885,10 +896,15 @@ static void wpaHandleMessage1(u32 key, u16 info) {
 		return;
 	}
 
+	// A retry of the same message gets the same answer
+	if (ptkReady && sameBytes(anonce, htcBuf + key + EAPOL_KEY_NONCE, sizeof(anonce))) {
+		logValue("Handshake 1 of 4 again, send : ", wpaSendKey(info, snonce, assocIe, assocIeLen));
+		return;
+	}
+
 	copyBytes(anonce, htcBuf + key + EAPOL_KEY_NONCE, sizeof(anonce));
 
 	// Our nonce: the saved key, the router's nonce and what timing we have
-	u8 snonce[EAPOL_NONCE_LEN];
 	u8 seed[13 + sizeof(selfMac) + sizeof(anonce) + 4 + 1];
 	clearBytes(seed, sizeof(seed));
 	copyBytes(seed, (const u8*)"Init Counter", 12);
@@ -1031,14 +1047,17 @@ static void wpaHandleData(void) {
 		}
 	}
 
+	// Message 1 has no MIC, so it can't move the replay counter
 	const u8* replay = htcBuf + key + EAPOL_KEY_REPLAY;
-	if (eapolReplaySet && !bytesLess(eapolReplay, replay, sizeof(eapolReplay))) {
-		logValue("EAPOL replay : ", info);
-		return;
+	if (info & EAPOL_INFO_MIC) {
+		if (verifiedReplaySet && !bytesLess(verifiedReplay, replay, sizeof(verifiedReplay))) {
+			logValue("EAPOL replay : ", info);
+			return;
+		}
+		copyBytes(verifiedReplay, replay, sizeof(verifiedReplay));
+		verifiedReplaySet = true;
 	}
 	copyBytes(eapolReplay, replay, sizeof(eapolReplay));
-	eapolReplaySet = true;
-	eapolVersion = htcBuf[eapol];
 	copyBytes(apMac, htcBuf + source, sizeof(apMac));
 
 	if (dataLen && (info & EAPOL_INFO_ENCRYPTED)) {
@@ -1356,6 +1375,7 @@ static void wifiClearSecrets(void) {
 	clearBytes(gtk, sizeof(gtk));
 	clearBytes(keyData, sizeof(keyData));
 	clearBytes(anonce, sizeof(anonce));
+	clearBytes(snonce, sizeof(snonce));
 	clearBytes(htcBuf, sizeof(htcWords));
 	clearBytes(txBuf, sizeof(txWords));
 	targetNetwork = NULL;
