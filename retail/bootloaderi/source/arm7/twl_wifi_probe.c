@@ -46,8 +46,12 @@
 #define SDIO_IRQ32		0x100
 #define SDIO_DATA32_BLK_LEN	0x104
 #define SDIO_DATA32_BLK_CNT	0x108
+#define SDIO_DATA32_FIFO	0x10C
 
 #define STAT0_CMDRESPEND	0x0001
+#define STAT0_DATAEND		0x0004
+#define STAT1_RXRDY		0x0100
+#define STAT1_TXRQ		0x0200
 #define STAT1_CMD_BUSY		0x4000
 #define STAT1_ERR		0x807F // ILL_ACCESS, CMDTIMEOUT, TXUNDERRUN, RXOVERFLOW, DATATIMEOUT, STOPBIT_ERR, CRCFAIL, CMD_IDX_ERR
 
@@ -56,6 +60,8 @@
 #define CMD5	(5  | (7 << 8)) // IO_SEND_OP_COND, 48-bit OCR response, no CRC7
 #define CMD7	(7  | (5 << 8)) // SELECT_CARD, 48-bit response with busy
 #define CMD52	(52 | (4 << 8)) // IO_RW_DIRECT, 48-bit response
+#define CMD53_WRITE	(53 | (4 << 8) | BIT(11) | BIT(14)) // IO_RW_EXTENDED, single block
+#define CMD53_READ	(CMD53_WRITE | BIT(12))
 
 #define TIMEOUT	0x100000
 
@@ -67,6 +73,7 @@
 // Function 1 registers
 #define F1_MBOX			0x0FF
 #define F1_RX_LOOKAHEAD_VALID	0x405
+#define F1_COUNT4		0x450
 #define F1_WINDOW_DATA		0x474
 #define F1_WINDOW_WRITE_ADDR	0x478
 #define F1_WINDOW_READ_ADDR	0x47C
@@ -79,7 +86,6 @@ static bool sdioError = false;
 static u16 sdioFirstErrCmd = 0;
 static u32 sdioFirstErrArg = 0;
 static u16 sdioFirstErrStat = 0;
-static bool wakeWritten = false;
 
 static inline u16 sdioRead16(u32 reg) {
 	return *(vu16*)(SDIO_BASE + reg);
@@ -251,6 +257,78 @@ static bool bmiGetVersion(u32* version) {
 	return true;
 }
 
+// Byte mode function 1 transfer of up to 4 bytes, polled through the 32-bit FIFO
+static bool cmd53(bool write, u32 addr, u32* data, u32 len) {
+	int i;
+	for (i = 0; i < TIMEOUT && (sdioRead16(SDIO_IRQ_STAT1) & STAT1_CMD_BUSY); i++);
+	if (i == TIMEOUT) {
+		sdioError = true;
+		return false;
+	}
+
+	const u32 arg = (write ? BIT(31) : 0) | (1 << 28) | BIT(26) | ((addr & 0x1FFFF) << 9) | len;
+	const u16 cmd = write ? CMD53_WRITE : CMD53_READ;
+	sdioWrite16(SDIO_IRQ_STAT0, 0);
+	sdioWrite16(SDIO_IRQ_STAT1, 0);
+	sdioWrite16(SDIO_CMD_PARAM0, arg & 0xFFFF);
+	sdioWrite16(SDIO_CMD_PARAM1, arg >> 16);
+	sdioWrite16(SDIO_DATA16_BLK_LEN, len);
+	sdioWrite16(SDIO_DATA16_BLK_CNT, 1);
+	sdioWrite16(SDIO_DATA32_BLK_LEN, len);
+	sdioWrite16(SDIO_DATA32_BLK_CNT, 1);
+	sdioWrite16(SDIO_CMD, cmd);
+
+	bool transferred = false;
+	bool ok = false;
+	u16 stat1 = 0;
+	for (i = 0; i < TIMEOUT; i++) {
+		stat1 = sdioRead16(SDIO_IRQ_STAT1);
+		if (stat1 & STAT1_ERR) {
+			break;
+		}
+		if (!write && !transferred && (sdioRead16(SDIO_IRQ32) & 0x100)) {
+			sdioMask16(SDIO_IRQ_STAT1, STAT1_RXRDY, 0);
+			*data = *(vu32*)(SDIO_BASE + SDIO_DATA32_FIFO);
+			transferred = true;
+		}
+		if (write && !transferred && (stat1 & STAT1_TXRQ)) {
+			sdioMask16(SDIO_IRQ_STAT1, STAT1_TXRQ, 0);
+			*(vu32*)(SDIO_BASE + SDIO_DATA32_FIFO) = *data;
+			transferred = true;
+		}
+		if (transferred && (sdioRead16(SDIO_IRQ_STAT0) & STAT0_DATAEND)) {
+			ok = true;
+			break;
+		}
+	}
+
+	sdioWrite16(SDIO_IRQ_STAT0, 0);
+	sdioWrite16(SDIO_IRQ_STAT1, 0);
+	if (!ok) {
+		if (!sdioFirstErrCmd) {
+			sdioFirstErrCmd = cmd;
+			sdioFirstErrArg = arg;
+			sdioFirstErrStat = stat1;
+		}
+		sdioError = true;
+	}
+	return ok;
+}
+
+// The way official code reads chip memory: three high address bytes, then the
+// low byte, which starts the read
+static u32 readInternWord53(u32 addr) {
+	u32 val = 0xFFFFFFFF;
+	for (int i = 3; i >= 0 && !sdioError; i--) {
+		u32 byte = (addr >> (i*8)) & 0xFF;
+		cmd53(true, F1_WINDOW_READ_ADDR + i, &byte, 1);
+	}
+	if (!sdioError) {
+		cmd53(false, F1_WINDOW_DATA, &val, 4);
+	}
+	return val;
+}
+
 static void logValue(const char* name, u32 val) {
 	dbg_printf(name);
 	dbg_hexa(val);
@@ -388,7 +466,7 @@ static void resetResult(twlWifiProbeResult* result) {
 	result->boardData = 0;
 	result->firmwareRam = 0;
 	result->firmwareRam2 = 0;
-	wakeWritten = false;
+	result->count4 = 0;
 	result->resetCause = 0;
 	result->bmiVersion = 0;
 	result->irqEnable = 0;
@@ -423,22 +501,17 @@ static int probeWarm(twlWifiProbeResult* result) {
 	result->manufacturer = read32(0, 0x1007);
 	if (sdioError) return -13;
 
-	result->chipId = readInternWord(0x000040EC);
-	if (sdioError) {
-		// Function 1 is silent: try the MCU WiFi register alone
-		sdioError = false;
-		wakeWritten = true;
-		i2cWriteRegister(0x4A, 0x30, 0x13);
-		swiDelay(0x40000);
-		result->chipId = readInternWord(0x000040EC);
-		if (sdioError) return -14;
-	}
+	// Reads only: is function 1 there for CMD53?
+	if (!cmd53(false, F1_COUNT4, &result->count4, 4)) return -16;
+
+	result->chipId = readInternWord53(0x000040EC);
+	if (sdioError) return -14;
 	const u32 hostInterest = (result->chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
-	result->firmwareUploaded = readInternWord(hostInterest + 0x58);
-	result->hostInterest0 = readInternWord(hostInterest);
-	result->boardData = readInternWord(hostInterest + 0x54);
-	result->firmwareRam = readInternWord(0x00524C00);
-	result->firmwareRam2 = readInternWord(0x00527000);
+	result->firmwareUploaded = readInternWord53(hostInterest + 0x58);
+	result->hostInterest0 = readInternWord53(hostInterest);
+	result->boardData = readInternWord53(hostInterest + 0x54);
+	result->firmwareRam = readInternWord53(0x00524C00);
+	result->firmwareRam2 = readInternWord53(0x00527000);
 	if (sdioError) return -15;
 
 	return 0;
@@ -451,10 +524,9 @@ void twlWifiEarlyCheck(void) {
 	resetResult(&result);
 
 	const u16 oldGpioWifi = REG_GPIO_WIFI;
-	const u8 oldLed = i2cReadRegister(0x4A, 0x30);
 	logValue("GPIO_WIFI : ", oldGpioWifi);
 	logValue("SCFG_WL : ", REG_SCFG_WL);
-	logValue("LED : ", oldLed);
+	logValue("LED : ", i2cReadRegister(0x4A, 0x30));
 	logValue("WL firm info 0 : ", *(vu32*)0x020005E0);
 	logValue("WL firm info 1 : ", *(vu32*)0x020005E4);
 	logValue("WL firm info 2 : ", *(vu32*)0x020005E8);
@@ -467,9 +539,6 @@ void twlWifiEarlyCheck(void) {
 	REG_GPIO_WIFI &= ~BIT(8); // Select Atheros
 	const int ret = probeWarm(&result);
 	sdioRestore(sdioSaved, sdioSavedIrqMask);
-	if (wakeWritten) {
-		i2cWriteRegister(0x4A, 0x30, oldLed);
-	}
 	REG_GPIO_WIFI = oldGpioWifi;
 
 	logValue("Result : ", (u32)ret);
@@ -482,13 +551,13 @@ void twlWifiEarlyCheck(void) {
 	logValue("First failed cmd : ", sdioFirstErrCmd);
 	logValue("First failed arg : ", sdioFirstErrArg);
 	logValue("First failed stat : ", sdioFirstErrStat);
+	logValue("F1 count4 : ", result.count4);
 	logValue("Chip ID : ", result.chipId);
 	logValue("Firmware uploaded : ", result.firmwareUploaded);
 	logValue("Host interest 0 : ", result.hostInterest0);
 	logValue("Board data : ", result.boardData);
 	logValue("Firmware RAM : ", result.firmwareRam);
 	logValue("Firmware RAM 2 : ", result.firmwareRam2);
-	logValue("Wake written : ", wakeWritten);
 	dbg_printf("\n");
 }
 
