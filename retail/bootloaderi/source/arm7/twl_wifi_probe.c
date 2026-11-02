@@ -52,6 +52,7 @@
 #define STAT1_ERR		0x807F // ILL_ACCESS, CMDTIMEOUT, TXUNDERRUN, RXOVERFLOW, DATATIMEOUT, STOPBIT_ERR, CRCFAIL, CMD_IDX_ERR
 
 // Command register values (index | response type << 8)
+#define CMD0	(0  | (3 << 8)) // GO_IDLE_STATE, no response
 #define CMD3	(3  | (4 << 8)) // SEND_RELATIVE_ADDR, 48-bit response
 #define CMD5	(5  | (7 << 8)) // IO_SEND_OP_COND, 48-bit OCR response, no CRC7
 #define CMD7	(7  | (5 << 8)) // SELECT_CARD, 48-bit response with busy
@@ -77,6 +78,10 @@ static u32 sdioResp = 0;
 static u16 sdioRca = 0;
 static bool sdioError = false;
 static bool readOnly = false;
+static u16 sdioFirstErrCmd = 0;
+static u32 sdioFirstErrArg = 0;
+static u16 sdioFirstErrStat = 0;
+static bool cardInitSkipped = false;
 
 static inline u16 sdioRead16(u32 reg) {
 	return *(vu16*)(SDIO_BASE + reg);
@@ -141,8 +146,10 @@ static bool sdioCommand(u16 cmd, u32 arg) {
 	sdioWrite16(SDIO_CMD, cmd);
 
 	bool ok = false;
+	u16 stat1Last = 0;
 	for (i = 0; i < TIMEOUT; i++) {
 		const u16 stat1 = sdioRead16(SDIO_IRQ_STAT1);
+		stat1Last = stat1;
 		if (stat1 & STAT1_ERR) {
 			break;
 		}
@@ -156,6 +163,11 @@ static bool sdioCommand(u16 cmd, u32 arg) {
 	sdioWrite16(SDIO_IRQ_STAT0, 0);
 	sdioWrite16(SDIO_IRQ_STAT1, 0);
 	if (!ok) {
+		if (!sdioError) {
+			sdioFirstErrCmd = cmd;
+			sdioFirstErrArg = arg;
+			sdioFirstErrStat = stat1Last;
+		}
 		sdioError = true;
 	}
 	return ok;
@@ -299,6 +311,13 @@ static int probe(twlWifiProbeResult* result) {
 
 	sdioWrite16(SDIO_STOP, 0x100);
 
+	// The card ignores CMD5 after a warm start unless this comes first
+	if (readOnly) {
+		sdioCommand(CMD0, 0);
+		sdioError = false;
+		swiDelay(0xF000);
+	}
+
 	// CMD5 until the card reports it's ready
 	u32 ocr = 0;
 	bool skipInit = false;
@@ -308,6 +327,7 @@ static int probe(twlWifiProbeResult* result) {
 			// Already initialized (e.g. by the system menu)
 			sdioError = false;
 			skipInit = true;
+			cardInitSkipped = true;
 			break;
 		}
 		ocr = sdioResp & 0xFFFFFF;
@@ -331,21 +351,29 @@ static int probe(twlWifiProbeResult* result) {
 		swiDelay(0xF000);
 	}
 
-	// Bus Interface Control: 4-bit mode and card detect
-	const u8 busControl = cmd52Read(0, 0x07);
-	if (sdioError) return -4;
-	if (!cmd52Write(0, 0x07, busControl | 0x82)) return -5;
-	sdioSetBusWidth(4);
+	if (!readOnly) {
+		// Bus Interface Control: 4-bit mode and card detect
+		const u8 busControl = cmd52Read(0, 0x07);
+		if (sdioError) return -4;
+		if (!cmd52Write(0, 0x07, busControl | 0x82)) return -5;
+		sdioSetBusWidth(4);
 
-	cmd52Write(0, 0x12, 0x02); // Power Control
-	cmd52Write(0, 0x110, 128); // Function 1 block size
-	cmd52Write(0, 0x111, 0);
-	cmd52Write(0, 0x10, 128); // Function 0 block size
-	cmd52Write(0, 0x11, 0);
-	if (sdioError) return -6;
-	swiDelay(0xF000);
+		cmd52Write(0, 0x12, 0x02); // Power Control
+		cmd52Write(0, 0x110, 128); // Function 1 block size
+		cmd52Write(0, 0x111, 0);
+		cmd52Write(0, 0x10, 128); // Function 0 block size
+		cmd52Write(0, 0x11, 0);
+		if (sdioError) return -6;
+		swiDelay(0xF000);
+	}
 
 	result->sdioRevision = cmd52Read(0, 0x00);
+
+	if (readOnly) {
+		result->ioEnable = cmd52Read(0, 0x02);
+		result->ioReady = cmd52Read(0, 0x03);
+		result->busControl = cmd52Read(0, 0x07);
+	}
 
 	// Enable function 1 and wait until it's ready
 	cmd52Write(0, 0x02, 0x02);
@@ -385,7 +413,14 @@ static void resetResult(twlWifiProbeResult* result) {
 	result->firmwareRam = 0;
 	result->resetCause = 0;
 	result->bmiVersion = 0;
+	result->ioEnable = 0;
+	result->ioReady = 0;
+	result->busControl = 0;
 	sdioError = false;
+	sdioFirstErrCmd = 0;
+	sdioFirstErrArg = 0;
+	sdioFirstErrStat = 0;
+	cardInitSkipped = false;
 }
 
 // Looks at the chip as it was left by whatever ran before us. Doesn't touch the
@@ -417,6 +452,15 @@ void twlWifiEarlyCheck(void) {
 	readOnly = false;
 
 	logValue("Result : ", (u32)ret);
+	logValue("Card init skipped : ", cardInitSkipped);
+	logValue("SDIO revision : ", result.sdioRevision);
+	logValue("Function enable : ", result.ioEnable);
+	logValue("Function ready : ", result.ioReady);
+	logValue("Bus control : ", result.busControl);
+	logValue("Manufacturer : ", result.manufacturer);
+	logValue("First failed cmd : ", sdioFirstErrCmd);
+	logValue("First failed arg : ", sdioFirstErrArg);
+	logValue("First failed stat : ", sdioFirstErrStat);
 	logValue("Chip ID : ", result.chipId);
 	logValue("Firmware uploaded : ", result.firmwareUploaded);
 	logValue("Host interest 0 : ", result.hostInterest0);
