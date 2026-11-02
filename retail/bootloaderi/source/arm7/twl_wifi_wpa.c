@@ -3,6 +3,8 @@
  * key unwrap. Written for small size, not speed; only the handshake uses it.
  */
 
+#pragma GCC optimize("Os")
+
 #include "twl_wifi_wpa.h"
 
 #define SHA1_BLOCK 64
