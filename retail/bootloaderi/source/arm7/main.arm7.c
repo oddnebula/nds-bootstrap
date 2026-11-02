@@ -1662,6 +1662,9 @@ int arm7_main(void) {
 		const u8 i2cVer = i2cReadRegister(0x4A, 0);
 		i2cBricked = (i2cVer == 0 || i2cVer == 0xFF);
 	}
+	if (logging && !i2cBricked && REG_SCFG_EXT != 0) {
+		twlWifiEarlyCheck();	// Log only
+	}
 	const bool dsiEnhancedMbk = (*(u32*)0x02FFE1A0 == 0x00403000 && ((REG_SCFG_EXT == 0) || (strncmp((const char*)0x04FFFA00, "no$gba", 6) == 0)));
 
 	aFile srParamsFile;
@@ -2241,10 +2244,6 @@ int arm7_main(void) {
 			NDSTouchscreenMode();
 			*(vu16*)0x4000500 = 0x807F;
 			if (!dsiModeConfirmed || !ROMsupportsDsiMode(&dsiHeaderTemp.ndshdr)) {
-				if (logging && !i2cBricked) {
-					twlWifiProbeResult wifiProbe;
-					twlWifiProbe(&wifiProbe);	// Log only: check DSi-mode WiFi before leaving it
-				}
 				REG_GPIO_WIFI |= BIT(8);	// Old NDS-Wifi mode
 			}
 		}

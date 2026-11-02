@@ -76,6 +76,7 @@
 static u32 sdioResp = 0;
 static u16 sdioRca = 0;
 static bool sdioError = false;
+static bool readOnly = false;
 
 static inline u16 sdioRead16(u32 reg) {
 	return *(vu16*)(SDIO_BASE + reg);
@@ -261,6 +262,16 @@ static void sdioSave(u16* saved, u32* savedIrqMask) {
 	*savedIrqMask = *(vu32*)(SDIO_BASE + SDIO_IRQ_MASK);
 }
 
+static void sdioRestore(const u16* saved, u32 savedIrqMask) {
+	sdioMask16(SDIO_CLK_CNT, 0x100, 0); // Stop the clock
+	sdioWrite16(SDIO_IRQ_STAT0, 0);
+	sdioWrite16(SDIO_IRQ_STAT1, 0);
+	*(vu32*)(SDIO_BASE + SDIO_IRQ_MASK) = savedIrqMask;
+	for (u32 i = 0; i < SDIO_SAVED_COUNT; i++) {
+		sdioWrite16(sdioSavedRegs[i], saved[i]);
+	}
+}
+
 // Puts the chip's SDIO side back to its power-on state, then the controller.
 // Replies aren't checked: the card stops answering once it's reset.
 static void sdioShutdown(const u16* saved, u32 savedIrqMask) {
@@ -271,13 +282,7 @@ static void sdioShutdown(const u16* saved, u32 savedIrqMask) {
 	cmd52Write(0, 0x06, 0x08); // I/O reset
 	swiDelay(0xF000);
 
-	sdioMask16(SDIO_CLK_CNT, 0x100, 0); // Stop the clock
-	sdioWrite16(SDIO_IRQ_STAT0, 0);
-	sdioWrite16(SDIO_IRQ_STAT1, 0);
-	*(vu32*)(SDIO_BASE + SDIO_IRQ_MASK) = savedIrqMask;
-	for (u32 i = 0; i < SDIO_SAVED_COUNT; i++) {
-		sdioWrite16(sdioSavedRegs[i], saved[i]);
-	}
+	sdioRestore(saved, savedIrqMask);
 }
 
 static int probe(twlWifiProbeResult* result) {
@@ -320,9 +325,11 @@ static int probe(twlWifiProbeResult* result) {
 		if (!sdioCommand(CMD7, (u32)sdioRca << 16)) return -3;
 	}
 
-	cmd52Write(0, 0x02, 0x00);
-	cmd52Write(0, 0x02, 0x02);
-	swiDelay(0xF000);
+	if (!readOnly) {
+		cmd52Write(0, 0x02, 0x00);
+		cmd52Write(0, 0x02, 0x02);
+		swiDelay(0xF000);
+	}
 
 	// Bus Interface Control: 4-bit mode and card detect
 	const u8 busControl = cmd52Read(0, 0x07);
@@ -349,7 +356,14 @@ static int probe(twlWifiProbeResult* result) {
 	result->chipId = readInternWord(0x000040EC);
 	const u32 hostInterest = (result->chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
 	result->firmwareUploaded = readInternWord(hostInterest + 0x58);
+	result->hostInterest0 = readInternWord(hostInterest);
+	result->boardData = readInternWord(hostInterest + 0x54);
+	result->firmwareRam = readInternWord(0x00524C00);
 	if (sdioError) return -8;
+
+	if (readOnly) {
+		return 0;
+	}
 
 	// Reset into the bootloader and ask for its version
 	writeInternWord(0x4000, 0x00000100);
@@ -361,16 +375,60 @@ static int probe(twlWifiProbeResult* result) {
 	return 0;
 }
 
-int twlWifiProbe(twlWifiProbeResult* result) {
-	dbg_printf("twlWifiProbe:\n");
-
+static void resetResult(twlWifiProbeResult* result) {
 	result->sdioRevision = 0;
 	result->manufacturer = 0;
 	result->chipId = 0;
 	result->firmwareUploaded = 0;
+	result->hostInterest0 = 0;
+	result->boardData = 0;
+	result->firmwareRam = 0;
 	result->resetCause = 0;
 	result->bmiVersion = 0;
 	sdioError = false;
+}
+
+// Looks at the chip as it was left by whatever ran before us. Doesn't touch the
+// LED/reset register, function enable state or the chip's CPU, and leaves the
+// card initialized.
+void twlWifiEarlyCheck(void) {
+	dbg_printf("twlWifiEarlyCheck:\n");
+
+	twlWifiProbeResult result;
+	resetResult(&result);
+	readOnly = true;
+
+	const u16 oldGpioWifi = REG_GPIO_WIFI;
+	logValue("GPIO_WIFI : ", oldGpioWifi);
+	logValue("SCFG_WL : ", REG_SCFG_WL);
+	logValue("LED : ", i2cReadRegister(0x4A, 0x30));
+	logValue("WL firm info 0 : ", *(vu32*)0x020005E0);
+	logValue("WL firm info 1 : ", *(vu32*)0x020005E4);
+
+	u16 sdioSaved[SDIO_SAVED_COUNT];
+	u32 sdioSavedIrqMask;
+	sdioSave(sdioSaved, &sdioSavedIrqMask);
+
+	REG_GPIO_WIFI &= ~BIT(8); // Select Atheros
+	const int ret = probe(&result);
+	sdioRestore(sdioSaved, sdioSavedIrqMask);
+	REG_GPIO_WIFI = oldGpioWifi;
+
+	readOnly = false;
+
+	logValue("Result : ", (u32)ret);
+	logValue("Chip ID : ", result.chipId);
+	logValue("Firmware uploaded : ", result.firmwareUploaded);
+	logValue("Host interest 0 : ", result.hostInterest0);
+	logValue("Board data : ", result.boardData);
+	logValue("Firmware RAM : ", result.firmwareRam);
+	dbg_printf("\n");
+}
+
+int twlWifiProbe(twlWifiProbeResult* result) {
+	dbg_printf("twlWifiProbe:\n");
+
+	resetResult(result);
 
 	const u16 oldGpioWifi = REG_GPIO_WIFI;
 	const u16 oldScfgWl = REG_SCFG_WL;
