@@ -627,6 +627,7 @@ void twlWifiEarlyCheck(void) {
 #define HTC_SRV_WMI_DATA_VO	0x0104
 #define HTC_FLAGS_WMI_DATA	5 // Reduce credit dribble, threshold 0.5
 #define WMI_EVENT_READY		0x1001
+#define WMI_PROTOCOL_VERSION	2
 
 #define WMI_CMD_GET_CHANNEL_LIST 0x000E
 #define WMI_CMD_ERROR_REPORT	0x0022
@@ -695,7 +696,12 @@ static bool htcRecv(void) {
 			return false;
 		}
 	}
-	return htcWords[0] == lookahead;
+	if (htcWords[0] != lookahead) {
+		logValue("Lookahead mismatch : ", lookahead);
+		logValue("Frame start : ", htcWords[0]);
+		return false;
+	}
+	return true;
 }
 
 // Returns the endpoint, or 0 on failure
@@ -717,6 +723,8 @@ static u8 htcConnect(u16 service, u16 flags) {
 }
 
 static u8 wmiEndpoint = 0;
+static u32 hostInterestAddr = 0;
+static u32 creditMessages = 0;
 
 static bool wmiSend(u16 id, u32 bodyLen) {
 	htcBuf[0] = wmiEndpoint;
@@ -791,7 +799,8 @@ static bool wmiWaitEvent(u16 event) {
 			continue;
 		}
 		if (htcBuf[0] != wmiEndpoint) {
-			continue; // Credit reports
+			creditMessages++;
+			continue;
 		}
 		const u16 id = htcGet16(HTC_HDR);
 		if (id == event) {
@@ -803,13 +812,25 @@ static bool wmiWaitEvent(u16 event) {
 }
 
 static int wmiScan(void) {
+	// The firmware ignores WMI commands until the host reports its protocol
+	// version, at the address held in the first host interest word
+	const u32 appHostInterest = readInternWord53(hostInterestAddr);
+	if (sdioError) return -60;
+	logValue("App host interest : ", appHostInterest);
+	writeInternWord53(appHostInterest, WMI_PROTOCOL_VERSION);
+	if (sdioError) return -61;
+
 	if (!wmiSendParam32(WMI_CMD_ERROR_REPORT, 0x7F)) return -48;
 	if (!wmiSendParam32(WMI_CMD_SET_HB_TIMEOUT, 0)) return -49;
 
 	// Only the channels the firmware allows
 	htcClear();
 	if (!wmiSend(WMI_CMD_GET_CHANNEL_LIST, 0)) return -57;
-	if (!wmiWaitEvent(WMI_CMD_GET_CHANNEL_LIST)) return -58;
+	if (!wmiWaitEvent(WMI_CMD_GET_CHANNEL_LIST)) {
+		logValue("Credit messages : ", creditMessages);
+		return -58;
+	}
+	logValue("Credit messages : ", creditMessages);
 	u16 channels[14];
 	u32 channelCount = 0;
 	for (u32 i = 0; i < htcBuf[WMI_BODY+1] && channelCount < 14; i++) {
@@ -861,7 +882,8 @@ static int wmiScan(void) {
 		}
 		silent = 0;
 		if (htcBuf[0] != wmiEndpoint) {
-			continue; // Credit reports
+			creditMessages++;
+			continue;
 		}
 		const u16 id = htcGet16(HTC_HDR);
 		if (id == WMI_EVENT_BSS_INFO) {
@@ -913,25 +935,8 @@ static int htcHandshake(void) {
 }
 
 // Soft resets the chip, keeping the firmware the system loaded, and restarts it,
-// in the same order official code uses, then waits for WMI to be ready.
-static int startFirmware(void) {
-	warmControllerInit();
-
-	cmd52Read(0, 0x04);
-	if (sdioError) return -20;
-	if (!(cmd52Read(0, 0x07) & 2)) return -21;
-	sdioMask16(SDIO_CARD_OPT, BIT(15), 0); // 4-bit
-
-	const u32 chipId = readInternWord53(0x000040EC);
-	if (sdioError) return -22;
-	logValue("Chip ID : ", chipId);
-	const u32 hostInterest = (chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
-
-	const u32 boardInit = readInternWord53(hostInterest + 0x58);
-	if (sdioError) return -23;
-	logValue("Board init before reset : ", boardInit);
-	if (boardInit == 0) return -24;
-
+// in the same order official code uses.
+static int restartFirmware(u32 hostInterest) {
 	writeInternWord53(0x00004000, 0x00000100);
 	if (sdioError) return -25;
 	swiDelay(0x80000);
@@ -971,17 +976,43 @@ static int startFirmware(void) {
 	logValue("Board init after start : ", ready);
 	if (!ready) return -37;
 
+	return 0;
+}
+
+// Starts the firmware, then waits for WMI to be ready and scans.
+static int startFirmware(void) {
+	warmControllerInit();
+
+	cmd52Read(0, 0x04);
+	if (sdioError) return -20;
+	if (!(cmd52Read(0, 0x07) & 2)) return -21;
+	sdioMask16(SDIO_CARD_OPT, BIT(15), 0); // 4-bit
+
+	const u32 chipId = readInternWord53(0x000040EC);
+	if (sdioError) return -22;
+	logValue("Chip ID : ", chipId);
+	const u32 hostInterest = (chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
+
+	const u32 boardInit = readInternWord53(hostInterest + 0x58);
+	if (sdioError) return -23;
+	logValue("Board init before reset : ", boardInit);
+	if (boardInit == 0) return -24;
+
+	const int restart = restartFirmware(hostInterest);
+	if (restart != 0) return restart;
+
 	const u32 boardData = readInternWord53(hostInterest + 0x54);
 	logValue("Board data : ", boardData);
 	logValue("EEPROM version : ", readInternWord53(boardData + 0x10));
 	if (sdioError) return -38;
 
+	hostInterestAddr = hostInterest;
 	const int ret = htcHandshake();
 
-	// Release the radio for the game: back to the bootloader, firmware kept
+	// Release the radio for the game with a fresh start. The game's WiFi search
+	// locks up if the chip is left in its bootloader, so firmware has to be running
 	sdioError = false;
-	writeInternWord53(0x00004000, 0x00000100);
-	swiDelay(0x80000);
+	logValue("Final restart : ", (u32)restartFirmware(hostInterest));
 	return ret;
 }
 
