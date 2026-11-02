@@ -501,6 +501,11 @@ static int probeWarm(twlWifiProbeResult* result) {
 	result->manufacturer = read32(0, 0x1007);
 	if (sdioError) return -13;
 
+	// CMD53 data follows the card's bus width, which the system left at 4-bit
+	if (result->busControl & 2) {
+		sdioMask16(SDIO_CARD_OPT, BIT(15), 0);
+	}
+
 	// Reads only: is function 1 there for CMD53?
 	if (!cmd53(false, F1_COUNT4, &result->count4, 4)) return -16;
 
