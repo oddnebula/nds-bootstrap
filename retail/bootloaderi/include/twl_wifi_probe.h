@@ -11,6 +11,7 @@ typedef struct {
 	u32 hostInterest0;
 	u32 boardData;
 	u32 firmwareRam;
+	u32 firmwareRam2;
 	u32 resetCause;
 	u32 bmiVersion;
 	u8 irqEnable;

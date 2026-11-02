@@ -79,6 +79,7 @@ static bool sdioError = false;
 static u16 sdioFirstErrCmd = 0;
 static u32 sdioFirstErrArg = 0;
 static u16 sdioFirstErrStat = 0;
+static bool wakeWritten = false;
 
 static inline u16 sdioRead16(u32 reg) {
 	return *(vu16*)(SDIO_BASE + reg);
@@ -386,6 +387,8 @@ static void resetResult(twlWifiProbeResult* result) {
 	result->hostInterest0 = 0;
 	result->boardData = 0;
 	result->firmwareRam = 0;
+	result->firmwareRam2 = 0;
+	wakeWritten = false;
 	result->resetCause = 0;
 	result->bmiVersion = 0;
 	result->irqEnable = 0;
@@ -421,12 +424,21 @@ static int probeWarm(twlWifiProbeResult* result) {
 	if (sdioError) return -13;
 
 	result->chipId = readInternWord(0x000040EC);
-	if (sdioError) return -14;
+	if (sdioError) {
+		// Function 1 is silent: try the MCU WiFi register alone
+		sdioError = false;
+		wakeWritten = true;
+		i2cWriteRegister(0x4A, 0x30, 0x13);
+		swiDelay(0x40000);
+		result->chipId = readInternWord(0x000040EC);
+		if (sdioError) return -14;
+	}
 	const u32 hostInterest = (result->chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
 	result->firmwareUploaded = readInternWord(hostInterest + 0x58);
 	result->hostInterest0 = readInternWord(hostInterest);
 	result->boardData = readInternWord(hostInterest + 0x54);
 	result->firmwareRam = readInternWord(0x00524C00);
+	result->firmwareRam2 = readInternWord(0x00527000);
 	if (sdioError) return -15;
 
 	return 0;
@@ -439,11 +451,14 @@ void twlWifiEarlyCheck(void) {
 	resetResult(&result);
 
 	const u16 oldGpioWifi = REG_GPIO_WIFI;
+	const u8 oldLed = i2cReadRegister(0x4A, 0x30);
 	logValue("GPIO_WIFI : ", oldGpioWifi);
 	logValue("SCFG_WL : ", REG_SCFG_WL);
-	logValue("LED : ", i2cReadRegister(0x4A, 0x30));
+	logValue("LED : ", oldLed);
 	logValue("WL firm info 0 : ", *(vu32*)0x020005E0);
 	logValue("WL firm info 1 : ", *(vu32*)0x020005E4);
+	logValue("WL firm info 2 : ", *(vu32*)0x020005E8);
+	logValue("WL firm info 3 : ", *(vu32*)0x020005EC);
 
 	u16 sdioSaved[SDIO_SAVED_COUNT];
 	u32 sdioSavedIrqMask;
@@ -452,6 +467,9 @@ void twlWifiEarlyCheck(void) {
 	REG_GPIO_WIFI &= ~BIT(8); // Select Atheros
 	const int ret = probeWarm(&result);
 	sdioRestore(sdioSaved, sdioSavedIrqMask);
+	if (wakeWritten) {
+		i2cWriteRegister(0x4A, 0x30, oldLed);
+	}
 	REG_GPIO_WIFI = oldGpioWifi;
 
 	logValue("Result : ", (u32)ret);
@@ -469,6 +487,8 @@ void twlWifiEarlyCheck(void) {
 	logValue("Host interest 0 : ", result.hostInterest0);
 	logValue("Board data : ", result.boardData);
 	logValue("Firmware RAM : ", result.firmwareRam);
+	logValue("Firmware RAM 2 : ", result.firmwareRam2);
+	logValue("Wake written : ", wakeWritten);
 	dbg_printf("\n");
 }
 
