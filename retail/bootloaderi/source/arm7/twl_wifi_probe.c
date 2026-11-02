@@ -10,6 +10,9 @@
  *   Copyright (c) 2021 Max Thomas
  *   Copyright (c) 2015-2016, Daz Jones
  *   Distributed under the MIT license, see dsiwifi_license.txt.
+ * The BMI, HTC and WMI sequences and message layouts follow Calico:
+ *   Copyright fincs, devkitPro
+ *   Distributed under the Zope Public License 2.1.
  * Changes from DSiWifi: every wait has a timeout, and only the parts needed to
  * identify the chip are kept.
  */
@@ -625,7 +628,21 @@ void twlWifiEarlyCheck(void) {
 #define HTC_FLAGS_WMI_DATA	5 // Reduce credit dribble, threshold 0.5
 #define WMI_EVENT_READY		0x1001
 
-static u32 htcWords[256/sizeof(u32)];
+#define WMI_CMD_START_SCAN	0x0007
+#define WMI_CMD_SET_SCAN_PARAMS	0x0008
+#define WMI_CMD_SET_BSS_FILTER	0x0009
+#define WMI_CMD_SET_PROBED_SSID	0x000A
+#define WMI_CMD_SET_CHANNEL_PARAMS 0x0011
+#define WMI_EVENT_BSS_INFO	0x1004
+#define WMI_EVENT_SCAN_COMPLETE	0x100A
+#define WMI_PHY_11G		2
+#define WMI_BSS_FILTER_ALL	1
+#define WMI_SCAN_CONNECT	BIT(0)
+#define HTC_FLAG_NEED_CREDIT_UPDATE 1
+
+#define CMD53_MAX_LEN		256
+
+static u32 htcWords[1600/sizeof(u32)];
 #define htcBuf ((u8*)htcWords)
 
 static inline u16 htcGet16(u32 offset) {
@@ -666,8 +683,14 @@ static bool htcRecv(void) {
 
 	const u32 lookahead = regs[2];
 	const u32 len = (HTC_HDR + (lookahead >> 16) + HTC_BLOCK - 1) & ~(HTC_BLOCK - 1);
-	if (len > sizeof(htcWords) || !cmd53(false, 0x1000 - len, htcWords, len)) {
+	if (len > sizeof(htcWords)) {
 		return false;
+	}
+	for (u32 done = 0; done < len; done += CMD53_MAX_LEN) {
+		const u32 chunk = (len - done > CMD53_MAX_LEN) ? CMD53_MAX_LEN : (len - done);
+		if (!cmd53(false, 0x1000 - len + done, htcWords + done/sizeof(u32), chunk)) {
+			return false;
+		}
 	}
 	return htcWords[0] == lookahead;
 }
@@ -690,13 +713,134 @@ static u8 htcConnect(u16 service, u16 flags) {
 	return endpoint;
 }
 
+static u8 wmiEndpoint = 0;
+
+static bool wmiSend(u16 id, u32 bodyLen) {
+	htcBuf[0] = wmiEndpoint;
+	htcBuf[1] = HTC_FLAG_NEED_CREDIT_UPDATE;
+	htcPut16(HTC_HDR, id);
+	return htcSend(2 + bodyLen);
+}
+
+#define WMI_BODY (HTC_HDR + 2)
+
+static inline void htcPut32(u32 offset, u32 val) {
+	htcPut16(offset, val & 0xFFFF);
+	htcPut16(offset+2, val >> 16);
+}
+
+// Logs one scan result: BSS header, then a beacon body with its information
+// elements after the timestamp, interval and capability fields
+static void logBss(u32 payloadLen) {
+	const u32 hdr = WMI_BODY;
+	const u32 end = HTC_HDR + payloadLen;
+	const u32 body = hdr + 16;
+	if (end > sizeof(htcWords) || body + 12 > end) {
+		return;
+	}
+
+	char ssid[33];
+	u32 ssidLen = 0;
+	bool rsn = false;
+	bool wpa = false;
+	for (u32 ie = body + 12; ie + 2 <= end; ie += 2 + htcBuf[ie+1]) {
+		const u8 id = htcBuf[ie];
+		const u8 len = htcBuf[ie+1];
+		if (ie + 2 + len > end) {
+			break;
+		}
+		if (id == 0 && len <= 32) {
+			for (u32 i = 0; i < len; i++) {
+				const u8 c = htcBuf[ie+2+i];
+				ssid[i] = (c >= 0x20 && c < 0x7F) ? c : '?';
+			}
+			ssidLen = len;
+		} else if (id == 48) {
+			rsn = true;
+		} else if (id == 221 && len >= 4 && htcBuf[ie+2] == 0x00 && htcBuf[ie+3] == 0x50
+		        && htcBuf[ie+4] == 0xF2 && htcBuf[ie+5] == 0x01) {
+			wpa = true;
+		}
+	}
+	ssid[ssidLen] = 0;
+
+	dbg_printf("BSS : ");
+	dbg_printf(ssid);
+	dbg_printf("\n");
+	logValue(" MHz : ", htcGet16(hdr));
+	logValue(" SNR : ", htcBuf[hdr+3]);
+	const bool privacy = htcBuf[body+10] & BIT(4);
+	dbg_printf(rsn ? " Security : WPA2\n" : wpa ? " Security : WPA\n" : privacy ? " Security : WEP\n" : " Security : Open\n");
+}
+
+static int wmiScan(void) {
+	// Passive scan of the 2.4 GHz channels, everything else off
+	htcClear();
+	if (!wmiSend(WMI_CMD_SET_PROBED_SSID, 35)) return -50;
+
+	htcClear();
+	htcBuf[WMI_BODY+2] = WMI_PHY_11G;
+	htcBuf[WMI_BODY+3] = 13;
+	for (u32 i = 0; i < 13; i++) {
+		htcPut16(WMI_BODY + 4 + i*2, 2412 + i*5);
+	}
+	if (!wmiSend(WMI_CMD_SET_CHANNEL_PARAMS, 4 + 13*2)) return -51;
+
+	htcClear();
+	htcPut16(WMI_BODY+0, 0xFFFF); // Foreground start period
+	htcPut16(WMI_BODY+2, 0xFFFF); // Foreground end period
+	htcPut16(WMI_BODY+4, 0xFFFF); // Background period
+	htcPut16(WMI_BODY+6, 105); // Max active dwell time
+	htcPut16(WMI_BODY+8, 105); // Passive dwell time
+	htcBuf[WMI_BODY+11] = WMI_SCAN_CONNECT;
+	htcPut16(WMI_BODY+12, 105); // Min active dwell time
+	if (!wmiSend(WMI_CMD_SET_SCAN_PARAMS, 20)) return -52;
+
+	htcClear();
+	htcBuf[WMI_BODY] = WMI_BSS_FILTER_ALL;
+	if (!wmiSend(WMI_CMD_SET_BSS_FILTER, 8)) return -53;
+
+	htcClear();
+	htcPut32(WMI_BODY+8, 20); // Home dwell time
+	if (!wmiSend(WMI_CMD_START_SCAN, 18)) return -54;
+
+	int silent = 0;
+	int results = 0;
+	for (int i = 0; i < 200 && silent < 6; i++) {
+		if (!htcRecv()) {
+			if (sdioError) return -55;
+			silent++;
+			continue;
+		}
+		silent = 0;
+		if (htcBuf[0] != wmiEndpoint) {
+			continue; // Credit reports
+		}
+		const u16 id = htcGet16(HTC_HDR);
+		if (id == WMI_EVENT_BSS_INFO) {
+			if (results < 24) {
+				logBss(htcGet16(2));
+			}
+			results++;
+		} else if (id == WMI_EVENT_SCAN_COMPLETE) {
+			logValue("Scan results : ", results);
+			logValue("Scan status : ", htcGet16(WMI_BODY) | (htcGet16(WMI_BODY+2) << 16));
+			return 0;
+		} else {
+			logValue("Other WMI event : ", id);
+		}
+	}
+	logValue("Scan results : ", results);
+	return -56;
+}
+
 static int htcHandshake(void) {
 	if (!htcRecv()) return -41;
 	if (htcBuf[0] != 0 || htcGet16(HTC_HDR) != HTC_MSG_READY) return -42;
 	logValue("HTC credits : ", htcGet16(HTC_HDR+2));
 	logValue("HTC credit size : ", htcGet16(HTC_HDR+4));
 
-	const u8 wmiEndpoint = htcConnect(HTC_SRV_WMI_CONTROL, 0);
+	wmiEndpoint = htcConnect(HTC_SRV_WMI_CONTROL, 0);
 	if (wmiEndpoint == 0) return -43;
 	logValue("WMI endpoint : ", wmiEndpoint);
 	for (u16 service = HTC_SRV_WMI_DATA_BE; service <= HTC_SRV_WMI_DATA_VO; service++) {
@@ -714,7 +858,7 @@ static int htcHandshake(void) {
 			logValue("MAC high : ", (mac[0] << 16) | (mac[1] << 8) | mac[2]);
 			logValue("MAC low : ", (mac[3] << 16) | (mac[4] << 8) | mac[5]);
 			logValue("PHY capability : ", mac[6]);
-			return 0;
+			return wmiScan();
 		}
 		logValue("Other message : ", htcWords[0]);
 	}
