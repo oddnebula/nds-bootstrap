@@ -68,5 +68,8 @@ Each step ends with something checkable in `NDSBTSRP.LOG` on hardware.
 6. **Run during the game**: move the driver from the bootloader into the in-game ARM7 engine (memory budget),
    keep the chip in DSi mode, and replace the WM request table entries (0x0C connect, 0x0D disconnect, 0x26 scan,
    0x11–0x13 data) with handlers that talk WMI and answer the game the way the original handlers did.
+   The game must also see a valid connection: DS games won't continue without one of connection slots 1-3 filled.
+   Plan: when the game reads those settings from flash, answer with a virtual slot 1 built from the saved system
+   connection, leaving the real flash alone, and report that network in the replaced scan results.
 7. **Wild World online**: DWC gets an IP and reaches the server (e.g. Wiimmfi), using the game's own TCP/IP stack
    on top of the replaced data path.

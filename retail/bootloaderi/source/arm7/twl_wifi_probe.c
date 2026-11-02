@@ -448,6 +448,10 @@ static bool channelsReady = false;
 static bool wifiAssociated = false;
 static bool wifiDisconnected = false;
 static u32 dataFrames = 0;
+static u32 controlMessages = 0;
+static u32 eventMessages = 0;
+static u32 dataMessages = 0;
+static u32 eapolMessages = 0;
 
 // WPA2 handshake state
 #define EAPOL_ETHERTYPE		0x888E
@@ -1018,6 +1022,8 @@ static void wpaHandleData(void) {
 		return;
 	}
 
+	eapolMessages++;
+
 	const u32 eapol = pos;
 	const u32 key = eapol + EAPOL_HDR;
 	if (wpaBusy || key + EAPOL_KEY_HDR > end) {
@@ -1123,9 +1129,13 @@ static bool wmiPump(void) {
 		return false;
 	}
 
-	if (htcBuf[0] == wmiEndpoint) {
+	if (htcBuf[0] == 0) {
+		controlMessages++;
+	} else if (htcBuf[0] == wmiEndpoint) {
+		eventMessages++;
 		wmiHandleEvent();
-	} else if (htcBuf[0] != 0 && htcPayloadLen != 0) {
+	} else if (htcPayloadLen != 0) {
+		dataMessages++;
 		wpaHandleData();
 	}
 	return true;
@@ -1224,7 +1234,7 @@ static void checkSavedKey(void) {
 }
 
 // Stops scanning and asks the firmware to join the network, as Calico does
-static int wmiConnect(void) {
+static int wmiJoin(void) {
 	checkSavedKey();
 
 	if (!wmiBegin() || !wmiSend(WMI_CMD_SET_BSS_FILTER, 8)) return -62;
@@ -1311,6 +1321,24 @@ static int wmiConnect(void) {
 
 	wmiCmd(WMI_CMD_DISCONNECT);
 	return wifiDisconnected ? -78 : 0;
+}
+
+static int wmiConnect(void) {
+	const u32 eventsBefore = eventMessages;
+	const int ret = wmiJoin();
+
+	u32 regs[3] = {0, 0, 0};
+	const bool sdioFailed = sdioError;
+	sdioError = false;
+	cmd53(false, 0x400, regs, sizeof(regs));
+	logValue("SDIO failed : ", sdioFailed);
+	logValue("Control messages : ", controlMessages);
+	logValue("Events while joining : ", eventMessages - eventsBefore);
+	logValue("Data messages : ", dataMessages);
+	logValue("EAPOL messages : ", eapolMessages);
+	logValue("Int and error status : ", regs[0]);
+	logValue("Mailbox status : ", regs[1]);
+	return ret;
 }
 
 static int htcHandshake(void) {
