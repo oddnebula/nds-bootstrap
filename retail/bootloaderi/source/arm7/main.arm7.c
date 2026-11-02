@@ -2244,6 +2244,9 @@ int arm7_main(void) {
 			NDSTouchscreenMode();
 			*(vu16*)0x4000500 = 0x807F;
 			if (!dsiModeConfirmed || !ROMsupportsDsiMode(&dsiHeaderTemp.ndshdr)) {
+				if (logging && !i2cBricked) {
+					twlWifiStartFirmware();	// Log only
+				}
 				REG_GPIO_WIFI |= BIT(8);	// Old NDS-Wifi mode
 			}
 		}

@@ -22,6 +22,7 @@ typedef struct {
 } twlWifiProbeResult;
 
 void twlWifiEarlyCheck(void);
+void twlWifiStartFirmware(void);
 int twlWifiProbe(twlWifiProbeResult* result);
 
 #endif // TWL_WIFI_PROBE_H

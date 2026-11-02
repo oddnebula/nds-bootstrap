@@ -78,6 +78,9 @@
 #define F1_WINDOW_WRITE_ADDR	0x478
 #define F1_WINDOW_READ_ADDR	0x47C
 
+#define BMI_DONE		0x1
+#define BMI_WRITE_MEMORY	0x3
+#define BMI_WRITE_SOC_REGISTER	0x7
 #define BMI_GET_TARGET_ID	0x8
 
 static u32 sdioResp = 0;
@@ -257,7 +260,7 @@ static bool bmiGetVersion(u32* version) {
 	return true;
 }
 
-// Byte mode function 1 transfer of up to 4 bytes, polled through the 32-bit FIFO
+// Byte mode function 1 transfer, polled through the 32-bit FIFO
 static bool cmd53(bool write, u32 addr, u32* data, u32 len) {
 	int i;
 	for (i = 0; i < TIMEOUT && (sdioRead16(SDIO_IRQ_STAT1) & STAT1_CMD_BUSY); i++);
@@ -288,12 +291,16 @@ static bool cmd53(bool write, u32 addr, u32* data, u32 len) {
 		}
 		if (!write && !transferred && (sdioRead16(SDIO_IRQ32) & 0x100)) {
 			sdioMask16(SDIO_IRQ_STAT1, STAT1_RXRDY, 0);
-			*data = *(vu32*)(SDIO_BASE + SDIO_DATA32_FIFO);
+			for (u32 w = 0; w < (len+3)/4; w++) {
+				data[w] = *(vu32*)(SDIO_BASE + SDIO_DATA32_FIFO);
+			}
 			transferred = true;
 		}
 		if (write && !transferred && (stat1 & STAT1_TXRQ)) {
 			sdioMask16(SDIO_IRQ_STAT1, STAT1_TXRQ, 0);
-			*(vu32*)(SDIO_BASE + SDIO_DATA32_FIFO) = *data;
+			for (u32 w = 0; w < (len+3)/4; w++) {
+				*(vu32*)(SDIO_BASE + SDIO_DATA32_FIFO) = data[w];
+			}
 			transferred = true;
 		}
 		if (transferred && (sdioRead16(SDIO_IRQ_STAT0) & STAT0_DATAEND)) {
@@ -327,6 +334,40 @@ static u32 readInternWord53(u32 addr) {
 		cmd53(false, F1_WINDOW_DATA, &val, 4);
 	}
 	return val;
+}
+
+static void writeInternWord53(u32 addr, u32 val) {
+	cmd53(true, F1_WINDOW_DATA, &val, 4);
+	for (int i = 3; i >= 0 && !sdioError; i--) {
+		u32 byte = (addr >> (i*8)) & 0xFF;
+		cmd53(true, F1_WINDOW_WRITE_ADDR + i, &byte, 1);
+	}
+}
+
+// BMI messages end at the top of mailbox 0
+static bool bmiSend(u32* msg, u32 len) {
+	u32 credits = 0;
+	for (int i = 0; i < 0x1000 && !credits; i++) {
+		if (!cmd53(false, F1_COUNT4, &credits, 4)) {
+			return false;
+		}
+		credits &= 0xFF;
+	}
+	return credits && cmd53(true, 0x1000 - len, msg, len);
+}
+
+static bool bmiRecv(u32* out) {
+	return cmd53(false, 0x1000 - sizeof(u32), out, sizeof(u32));
+}
+
+static bool bmiWriteMemoryWord(u32 addr, u32 val) {
+	u32 msg[4] = {BMI_WRITE_MEMORY, addr, sizeof(u32), val};
+	return bmiSend(msg, sizeof(msg));
+}
+
+static bool bmiWriteSocReg(u32 addr, u32 val) {
+	u32 msg[3] = {BMI_WRITE_SOC_REGISTER, addr, val};
+	return bmiSend(msg, sizeof(msg));
 }
 
 static void logValue(const char* name, u32 val) {
@@ -482,7 +523,7 @@ static void resetResult(twlWifiProbeResult* result) {
 // Reads the state of a chip the system already set up, in the order official
 // code does it: a register read at the slow identification clock decides if the
 // card needs bootup at all. Nothing here reinitializes or reconfigures the card.
-static int probeWarm(twlWifiProbeResult* result) {
+static void warmControllerInit(void) {
 	sdioControllerInit();
 	sdioMask16(SDIO_PORT_SEL, 3, 0);
 	sdioMask16(SDIO_CLK_CNT, 0x100, 0);
@@ -490,6 +531,10 @@ static int probeWarm(twlWifiProbeResult* result) {
 	sdioMask16(SDIO_CLK_CNT, 0, 0x100);
 	sdioMask16(SDIO_CARD_OPT, 0, BIT(15)); // 1-bit
 	swiDelay(0xF000);
+}
+
+static int probeWarm(twlWifiProbeResult* result) {
+	warmControllerInit();
 
 	result->irqEnable = cmd52Read(0, 0x04);
 	if (sdioError) return -12; // Needs bootup, so it isn't warm
@@ -563,6 +608,112 @@ void twlWifiEarlyCheck(void) {
 	logValue("Board data : ", result.boardData);
 	logValue("Firmware RAM : ", result.firmwareRam);
 	logValue("Firmware RAM 2 : ", result.firmwareRam2);
+	dbg_printf("\n");
+}
+
+// Soft resets the chip, keeping the firmware the system loaded, and restarts it,
+// in the same order official code uses. Doesn't go as far as the HTC handshake.
+static int startFirmware(void) {
+	warmControllerInit();
+
+	cmd52Read(0, 0x04);
+	if (sdioError) return -20;
+	if (!(cmd52Read(0, 0x07) & 2)) return -21;
+	sdioMask16(SDIO_CARD_OPT, BIT(15), 0); // 4-bit
+
+	const u32 chipId = readInternWord53(0x000040EC);
+	if (sdioError) return -22;
+	logValue("Chip ID : ", chipId);
+	const u32 hostInterest = (chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
+
+	const u32 boardInit = readInternWord53(hostInterest + 0x58);
+	if (sdioError) return -23;
+	logValue("Board init before reset : ", boardInit);
+	if (boardInit == 0) return -24;
+
+	writeInternWord53(0x00004000, 0x00000100);
+	if (sdioError) return -25;
+	swiDelay(0x80000);
+	const u32 resetCause = readInternWord53(0x000040C0);
+	if (sdioError) return -26;
+	logValue("Reset cause : ", resetCause);
+	if ((resetCause & 7) != 2) return -27;
+
+	u32 cmd = BMI_GET_TARGET_ID;
+	u32 version = 0;
+	if (!bmiSend(&cmd, sizeof(cmd)) || !bmiRecv(&version)) return -28;
+	if (version == 0xFFFFFFFF) {
+		u32 size = 0;
+		u32 type = 0;
+		if (!bmiRecv(&size) || !bmiRecv(&version) || !bmiRecv(&type)) return -29;
+		logValue("BMI target type : ", type);
+	}
+	logValue("BMI version : ", version);
+
+	if (!bmiWriteMemoryWord(hostInterest + 0x00, 2)) return -30; // HTC protocol version
+	if (!bmiWriteSocReg(0x4028, 5)) return -31; // WLAN_CLOCK_CONTROL
+	if (!bmiWriteSocReg(0x4020, 0)) return -32; // WLAN_CPU_CLOCK
+	if (!bmiWriteMemoryWord(hostInterest + 0x6C, 128)) return -33; // Mailbox block size
+	if (!bmiWriteMemoryWord(hostInterest + 0x74, 0x63)) return -34;
+
+	cmd = BMI_DONE;
+	if (!bmiSend(&cmd, sizeof(cmd))) return -35;
+
+	u32 attempts;
+	u32 ready = 0;
+	for (attempts = 0; attempts < 2000 && !ready; attempts++) {
+		ready = readInternWord53(hostInterest + 0x58);
+		if (sdioError) return -36;
+		swiDelay(0x2000);
+	}
+	logValue("Firmware start attempts : ", attempts);
+	logValue("Board init after start : ", ready);
+	if (!ready) return -37;
+
+	const u32 boardData = readInternWord53(hostInterest + 0x54);
+	logValue("Board data : ", boardData);
+	logValue("EEPROM version : ", readInternWord53(boardData + 0x10));
+	if (sdioError) return -38;
+
+	// The firmware announces itself with an HTC message
+	u32 regs[3];
+	for (attempts = 0; attempts < 200; attempts++) {
+		if (!cmd53(false, 0x400, regs, sizeof(regs))) return -39;
+		if ((regs[0] & 1) && (regs[1] & 0x100)) {
+			break;
+		}
+		swiDelay(0x4000);
+	}
+	logValue("Mailbox attempts : ", attempts);
+	logValue("Int status : ", regs[0]);
+	logValue("Mailbox frame : ", regs[1]);
+	logValue("Lookahead : ", regs[2]);
+	if (attempts == 200) return -40;
+
+	return 0;
+}
+
+void twlWifiStartFirmware(void) {
+	dbg_printf("twlWifiStartFirmware:\n");
+
+	twlWifiProbeResult unused;
+	resetResult(&unused);
+
+	const u16 oldGpioWifi = REG_GPIO_WIFI;
+
+	u16 sdioSaved[SDIO_SAVED_COUNT];
+	u32 sdioSavedIrqMask;
+	sdioSave(sdioSaved, &sdioSavedIrqMask);
+
+	REG_GPIO_WIFI &= ~BIT(8); // Select Atheros
+	const int ret = startFirmware();
+	sdioRestore(sdioSaved, sdioSavedIrqMask);
+	REG_GPIO_WIFI = oldGpioWifi;
+
+	logValue("Result : ", (u32)ret);
+	logValue("First failed cmd : ", sdioFirstErrCmd);
+	logValue("First failed arg : ", sdioFirstErrArg);
+	logValue("First failed stat : ", sdioFirstErrStat);
 	dbg_printf("\n");
 }
 
