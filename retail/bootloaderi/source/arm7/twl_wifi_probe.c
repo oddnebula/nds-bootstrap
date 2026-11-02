@@ -82,6 +82,7 @@ static u16 sdioFirstErrCmd = 0;
 static u32 sdioFirstErrArg = 0;
 static u16 sdioFirstErrStat = 0;
 static bool cardInitSkipped = false;
+static bool functionToggled = false;
 
 static inline u16 sdioRead16(u32 reg) {
 	return *(vu16*)(SDIO_BASE + reg);
@@ -163,7 +164,7 @@ static bool sdioCommand(u16 cmd, u32 arg) {
 	sdioWrite16(SDIO_IRQ_STAT0, 0);
 	sdioWrite16(SDIO_IRQ_STAT1, 0);
 	if (!ok) {
-		if (!sdioError) {
+		if (!sdioFirstErrCmd) {
 			sdioFirstErrCmd = cmd;
 			sdioFirstErrArg = arg;
 			sdioFirstErrStat = stat1Last;
@@ -380,6 +381,20 @@ static int probe(twlWifiProbeResult* result) {
 	for (i = 0; i < 0x10000 && !sdioError && cmd52Read(0, 0x03) != 0x02; i++);
 	if (i == 0x10000 || sdioError) return -7;
 
+	// A chip left running by the system may not answer on function 1 until
+	// the function is toggled
+	if (readOnly) {
+		cmd52Read(1, F1_RX_LOOKAHEAD_VALID);
+		if (sdioError) {
+			sdioError = false;
+			functionToggled = true;
+			cmd52Write(0, 0x02, 0x00);
+			cmd52Write(0, 0x02, 0x02);
+			for (i = 0; i < 0x10000 && !sdioError && cmd52Read(0, 0x03) != 0x02; i++);
+			if (i == 0x10000 || sdioError) return -11;
+		}
+	}
+
 	result->manufacturer = read32(0, 0x1007);
 	result->chipId = readInternWord(0x000040EC);
 	const u32 hostInterest = (result->chipId == CHIP_ID_AR6002) ? AR6002_HOST_INTEREST_ADDRESS : AR601x_HOST_INTEREST_ADDRESS;
@@ -421,11 +436,12 @@ static void resetResult(twlWifiProbeResult* result) {
 	sdioFirstErrArg = 0;
 	sdioFirstErrStat = 0;
 	cardInitSkipped = false;
+	functionToggled = false;
 }
 
 // Looks at the chip as it was left by whatever ran before us. Doesn't touch the
-// LED/reset register, function enable state or the chip's CPU, and leaves the
-// card initialized.
+// LED/reset register or the chip's CPU, and leaves the card initialized. Function
+// 1 is only toggled if it doesn't answer.
 void twlWifiEarlyCheck(void) {
 	dbg_printf("twlWifiEarlyCheck:\n");
 
@@ -453,6 +469,7 @@ void twlWifiEarlyCheck(void) {
 
 	logValue("Result : ", (u32)ret);
 	logValue("Card init skipped : ", cardInitSkipped);
+	logValue("Function toggled : ", functionToggled);
 	logValue("SDIO revision : ", result.sdioRevision);
 	logValue("Function enable : ", result.ioEnable);
 	logValue("Function ready : ", result.ioReady);
