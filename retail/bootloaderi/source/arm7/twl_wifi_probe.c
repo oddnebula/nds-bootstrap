@@ -611,8 +611,118 @@ void twlWifiEarlyCheck(void) {
 	dbg_printf("\n");
 }
 
+// HTC: every message starts with endpoint, flags, payload length, trailer length
+// and a pad byte. Packets are rounded up to the mailbox block size.
+#define HTC_BLOCK		128
+#define HTC_HDR			6
+#define HTC_MSG_READY		1
+#define HTC_MSG_CONNECT		2
+#define HTC_MSG_CONNECT_REPLY	3
+#define HTC_MSG_SETUP_COMPLETE	4
+#define HTC_SRV_WMI_CONTROL	0x0100
+#define HTC_SRV_WMI_DATA_BE	0x0101
+#define HTC_SRV_WMI_DATA_VO	0x0104
+#define HTC_FLAGS_WMI_DATA	5 // Reduce credit dribble, threshold 0.5
+#define WMI_EVENT_READY		0x1001
+
+static u32 htcWords[256/sizeof(u32)];
+#define htcBuf ((u8*)htcWords)
+
+static inline u16 htcGet16(u32 offset) {
+	return htcBuf[offset] | (htcBuf[offset+1] << 8);
+}
+
+static inline void htcPut16(u32 offset, u16 val) {
+	htcBuf[offset] = val & 0xFF;
+	htcBuf[offset+1] = val >> 8;
+}
+
+static void htcClear(void) {
+	for (u32 i = 0; i < sizeof(htcWords)/sizeof(u32); i++) {
+		htcWords[i] = 0;
+	}
+}
+
+static bool htcSend(u32 payloadLen) {
+	htcPut16(2, payloadLen);
+	return cmd53(true, 0x1000 - HTC_BLOCK, htcWords, HTC_BLOCK);
+}
+
+static bool htcRecv(void) {
+	u32 regs[3];
+	u32 attempts;
+	for (attempts = 0; attempts < 200; attempts++) {
+		if (!cmd53(false, 0x400, regs, sizeof(regs))) {
+			return false;
+		}
+		if ((regs[0] & 1) && (regs[1] & 0x100)) {
+			break;
+		}
+		swiDelay(0x4000);
+	}
+	if (attempts == 200) {
+		return false;
+	}
+
+	const u32 lookahead = regs[2];
+	const u32 len = (HTC_HDR + (lookahead >> 16) + HTC_BLOCK - 1) & ~(HTC_BLOCK - 1);
+	if (len > sizeof(htcWords) || !cmd53(false, 0x1000 - len, htcWords, len)) {
+		return false;
+	}
+	return htcWords[0] == lookahead;
+}
+
+// Returns the endpoint, or 0 on failure
+static u8 htcConnect(u16 service, u16 flags) {
+	htcClear();
+	htcPut16(HTC_HDR, HTC_MSG_CONNECT);
+	htcPut16(HTC_HDR+2, service);
+	htcPut16(HTC_HDR+4, flags);
+	if (!htcSend(HTC_HDR + 8) || !htcRecv()) {
+		return 0;
+	}
+
+	const u8 endpoint = htcBuf[HTC_HDR+5];
+	if (htcBuf[0] != 0 || htcGet16(HTC_HDR) != HTC_MSG_CONNECT_REPLY || htcGet16(HTC_HDR+2) != service
+	 || htcBuf[HTC_HDR+4] != 0 || endpoint == 0 || endpoint > 8) {
+		return 0;
+	}
+	return endpoint;
+}
+
+static int htcHandshake(void) {
+	if (!htcRecv()) return -41;
+	if (htcBuf[0] != 0 || htcGet16(HTC_HDR) != HTC_MSG_READY) return -42;
+	logValue("HTC credits : ", htcGet16(HTC_HDR+2));
+	logValue("HTC credit size : ", htcGet16(HTC_HDR+4));
+
+	const u8 wmiEndpoint = htcConnect(HTC_SRV_WMI_CONTROL, 0);
+	if (wmiEndpoint == 0) return -43;
+	logValue("WMI endpoint : ", wmiEndpoint);
+	for (u16 service = HTC_SRV_WMI_DATA_BE; service <= HTC_SRV_WMI_DATA_VO; service++) {
+		if (htcConnect(service, HTC_FLAGS_WMI_DATA) == 0) return -44;
+	}
+
+	htcClear();
+	htcPut16(HTC_HDR, HTC_MSG_SETUP_COMPLETE);
+	if (!htcSend(HTC_HDR + 2)) return -45;
+
+	for (int i = 0; i < 8; i++) {
+		if (!htcRecv()) return -46;
+		if (htcBuf[0] == wmiEndpoint && htcGet16(HTC_HDR) == WMI_EVENT_READY) {
+			const u8* mac = htcBuf + HTC_HDR + 2;
+			logValue("MAC high : ", (mac[0] << 16) | (mac[1] << 8) | mac[2]);
+			logValue("MAC low : ", (mac[3] << 16) | (mac[4] << 8) | mac[5]);
+			logValue("PHY capability : ", mac[6]);
+			return 0;
+		}
+		logValue("Other message : ", htcWords[0]);
+	}
+	return -47;
+}
+
 // Soft resets the chip, keeping the firmware the system loaded, and restarts it,
-// in the same order official code uses. Doesn't go as far as the HTC handshake.
+// in the same order official code uses, then waits for WMI to be ready.
 static int startFirmware(void) {
 	warmControllerInit();
 
@@ -675,22 +785,7 @@ static int startFirmware(void) {
 	logValue("EEPROM version : ", readInternWord53(boardData + 0x10));
 	if (sdioError) return -38;
 
-	// The firmware announces itself with an HTC message
-	u32 regs[3];
-	for (attempts = 0; attempts < 200; attempts++) {
-		if (!cmd53(false, 0x400, regs, sizeof(regs))) return -39;
-		if ((regs[0] & 1) && (regs[1] & 0x100)) {
-			break;
-		}
-		swiDelay(0x4000);
-	}
-	logValue("Mailbox attempts : ", attempts);
-	logValue("Int status : ", regs[0]);
-	logValue("Mailbox frame : ", regs[1]);
-	logValue("Lookahead : ", regs[2]);
-	if (attempts == 200) return -40;
-
-	return 0;
+	return htcHandshake();
 }
 
 void twlWifiStartFirmware(void) {
